@@ -1,0 +1,12 @@
+{
+  "_entry_point": "supplier_capacity_change",
+  "_description": "Supplier announces capacity reduction \u2014 re-plan against new ceiling.",
+  "payload": {
+    "signal_id": "supp-cap-2026-0612",
+    "plant_id": "plant-portland-01",
+    "supplier_id": "supp-fasteners-na",
+    "capacity_reduction_pct": 0.3,
+    "effective_date": "2026-06-15",
+    "duration_estimate_days": 60
+  }
+}

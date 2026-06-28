@@ -1,0 +1,230 @@
+"""Dev-mode store for production planning.
+
+Stands in for the plant's systems of record so the FULL chain runs
+end-to-end before any connector is wired:
+  * MES / ERP work-centre calendar → line/shift/equipment capacity
+  * ERP / MRP                        → BOM + on-hand inventory
+  * supplier master                 → lead times, alternates, signals
+  * the current released schedule    → what's on the floor right now
+
+Replace each read with the matching MCP connector in prod; the function
+signatures are the contract. The integration points (do nothing until
+the calls here are wired):
+  * MES_MCP_URL          → line_capacity()         (capacity_model_agent)
+  * ERP_MRP_MCP_URL      → bom() / on_hand()       (material_requirements_agent)
+  * MES_HISTORIAN_MCP_URL→ analytics rollups       (planning_analytics_agent)
+Setting those env vars alone does nothing until you wire the calls here.
+
+Single-process JSON files under ./data — survives the HITL wait because
+the mesh is one process. Swap for the Redis/Postgres session store at
+multi-replica scale; the get/put interface stays the same.
+"""
+from __future__ import annotations
+
+import json
+import threading
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+_LOCK = threading.Lock()
+_DIR = Path("./data")
+PLANT = "PLANT-PDX"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _days(n: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(days=n)).isoformat()
+
+
+def _path(k: str) -> Path:
+    _DIR.mkdir(parents=True, exist_ok=True)
+    return _DIR / f"{k}.json"
+
+
+def _load(k: str) -> Any:
+    p = _path(k)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except (ValueError, OSError):
+        return None
+
+
+def _save(k: str, d: Any) -> None:
+    p = _path(k)
+    t = p.with_suffix(".json.tmp")
+    t.write_text(json.dumps(d, indent=2, default=str))
+    t.replace(p)
+
+
+# ── Seed data — a realistic Portland plant snapshot ──────────────────
+# Three lines, two shifts. Demand slightly over effective capacity so a
+# clean re-opt is possible but a supplier slip / safety-stock breach is
+# what actually forces the planner — the interesting paths all reachable.
+_SEED_DEMAND = {
+    "plant_id": PLANT,
+    "planning_window_days": 14,
+    "captured_at_utc": None,                       # stamped on first read
+    "sku_demands": [
+        {"sku": "WIDGET-A", "units": 4200, "due_date": _days(7),  "customer_segment": "retail",      "tier": "top20"},
+        {"sku": "WIDGET-B", "units": 3100, "due_date": _days(10), "customer_segment": "wholesale",   "tier": "standard"},
+        {"sku": "GADGET-C", "units": 2600, "due_date": _days(5),  "customer_segment": "retail",      "tier": "top20"},
+        {"sku": "GADGET-D", "units": 1500, "due_date": _days(12), "customer_segment": "distributor", "tier": "standard"},
+        {"sku": "BRACKET-E", "units": 1000, "due_date": _days(9), "customer_segment": "oem",         "tier": "standard"},
+    ],
+    "notable_shifts": [
+        "WIDGET-A forecast +18% vs prior period (retail promo)",
+        "GADGET-C pulled in 2 days (expedite request)",
+    ],
+}
+
+_SEED_CAPACITY = {
+    "plant_id": PLANT,
+    "total_capacity_hours": 1008.0,                # 3 lines × 2 shifts × 8h × 14 days / norm
+    "effective_capacity_hours": 882.0,             # net of maintenance + changeover
+    "bottleneck_lines": ["LINE-2"],
+    "planned_maintenance_windows": [
+        {"line_id": "LINE-2", "start_utc": _days(3), "end_utc": _days(4), "reason": "preventive"},
+    ],
+    "lines": [
+        {"line_id": "LINE-1", "shifts": ["DAY", "SWING"], "units_per_hour": 70, "skus": ["WIDGET-A", "WIDGET-B"]},
+        {"line_id": "LINE-2", "shifts": ["DAY", "SWING"], "units_per_hour": 55, "skus": ["GADGET-C", "GADGET-D"]},
+        {"line_id": "LINE-3", "shifts": ["DAY"],          "units_per_hour": 40, "skus": ["BRACKET-E"]},
+    ],
+}
+
+# BOM: finished SKU → components (material, qty per finished unit).
+_SEED_BOM = {
+    "WIDGET-A":  [{"material": "MAT-STEEL", "qty_per_unit": 2}, {"material": "MAT-POLY", "qty_per_unit": 1}],
+    "WIDGET-B":  [{"material": "MAT-STEEL", "qty_per_unit": 1}, {"material": "MAT-POLY", "qty_per_unit": 2}],
+    "GADGET-C":  [{"material": "MAT-CHIP",  "qty_per_unit": 1}, {"material": "MAT-POLY", "qty_per_unit": 1}],
+    "GADGET-D":  [{"material": "MAT-CHIP",  "qty_per_unit": 1}],
+    "BRACKET-E": [{"material": "MAT-STEEL", "qty_per_unit": 3}],
+}
+
+# On-hand inventory + safety stock floor per material.
+_SEED_MATERIALS = {
+    "MAT-STEEL": {"on_hand": 14000, "safety_stock": 2000, "supplier_id": "SUP-NW-METALS", "lead_time_days": 7},
+    "MAT-POLY":  {"on_hand": 9000,  "safety_stock": 1500, "supplier_id": "SUP-POLYCHEM",  "lead_time_days": 10},
+    "MAT-CHIP":  {"on_hand": 3000,  "safety_stock": 800,  "supplier_id": "SUP-SILICON",   "lead_time_days": 21},
+}
+
+_SEED_SUPPLIERS = {
+    "SUP-NW-METALS": {"name": "NW Metals",  "reliability": 0.96, "alternates": ["SUP-CASCADE-STEEL"]},
+    "SUP-POLYCHEM":  {"name": "PolyChem",   "reliability": 0.91, "alternates": ["SUP-RESINCO"]},
+    "SUP-SILICON":   {"name": "Silicon Ltd","reliability": 0.84, "alternates": []},   # single-source — slips force a human
+}
+
+# The schedule currently on the floor (what a re-opt revises).
+_SEED_SCHEDULE = {
+    "schedule_id": "sch-current-0001",
+    "released_at_utc": _days(-1),
+    "on_time_delivery_pct": 0.94,
+    "sequenced_orders": [
+        {"sku": "GADGET-C", "units": 2600, "line_id": "LINE-2", "shift_id": "DAY",   "start_utc": _days(0), "end_utc": _days(2)},
+        {"sku": "WIDGET-A", "units": 4200, "line_id": "LINE-1", "shift_id": "DAY",   "start_utc": _days(0), "end_utc": _days(4)},
+        {"sku": "WIDGET-B", "units": 3100, "line_id": "LINE-1", "shift_id": "SWING", "start_utc": _days(4), "end_utc": _days(8)},
+    ],
+}
+
+
+def _seeded(key: str, seed: Any) -> Any:
+    s = _load(key)
+    if s is None:
+        s = seed
+        if isinstance(s, dict) and "captured_at_utc" in s and not s["captured_at_utc"]:
+            s = {**s, "captured_at_utc": _now()}
+        _save(key, s)
+    return s
+
+
+# ── Reads (the plant's systems of record) ────────────────────────────
+def demand_picture(plant_id: str = PLANT) -> dict[str, Any]:
+    """Planning-ready demand for the window. PROD: forecast service / ERP."""
+    return _seeded("demand", _SEED_DEMAND)
+
+
+def line_capacity(plant_id: str = PLANT) -> dict[str, Any]:
+    """Line/shift/equipment availability. PROD: MES work-centre calendar."""
+    return _seeded("capacity", _SEED_CAPACITY)
+
+
+def bom(sku: str = "") -> dict[str, Any]:
+    """Bills of material. PROD: ERP/MRP. Returns one SKU or the whole book."""
+    book = _seeded("bom", _SEED_BOM)
+    return {sku: book.get(sku, [])} if sku else dict(book)
+
+
+def on_hand(material: str = "") -> dict[str, Any]:
+    """On-hand inventory + safety stock. PROD: ERP/MRP."""
+    mats = _seeded("materials", _SEED_MATERIALS)
+    return {material: mats.get(material, {})} if material else dict(mats)
+
+
+def suppliers() -> dict[str, Any]:
+    """Supplier master (reliability, alternates). PROD: ERP vendor master."""
+    return _seeded("suppliers", _SEED_SUPPLIERS)
+
+
+def current_schedule(plant_id: str = PLANT) -> dict[str, Any]:
+    """The schedule on the floor right now — what a re-opt revises."""
+    return _seeded("schedule", _SEED_SCHEDULE)
+
+
+# ── Domain math the gate floors rely on (deterministic, no LLM) ──────
+def material_shortfalls(sku_demands: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Explode demand × BOM against on-hand minus safety stock and return
+    materials that would breach their safety-stock floor. PROD: MRP
+    explosion in the ERP. This is the material-availability floor's math.
+
+    Returns [{material, required, available_above_safety, shortfall,
+              breaches_safety_stock}] for any material that comes up short.
+    """
+    book = bom()
+    mats = on_hand()
+    required: dict[str, float] = {}
+    for d in sku_demands or []:
+        if not isinstance(d, dict):
+            continue
+        units = float(d.get("units") or 0)
+        for comp in book.get(str(d.get("sku") or ""), []):
+            m = comp.get("material")
+            required[m] = required.get(m, 0.0) + units * float(comp.get("qty_per_unit") or 0)
+
+    out: list[dict[str, Any]] = []
+    for m, req in required.items():
+        rec = mats.get(m, {})
+        oh = float(rec.get("on_hand") or 0)
+        ss = float(rec.get("safety_stock") or 0)
+        avail = oh - ss
+        if req > avail:
+            out.append({
+                "material": m,
+                "required": round(req, 2),
+                "available_above_safety": round(avail, 2),
+                "shortfall": round(req - avail, 2),
+                "breaches_safety_stock": True,
+                "supplier_id": rec.get("supplier_id", ""),
+                "lead_time_days": rec.get("lead_time_days", 0),
+            })
+    return out
+
+
+def capacity_overrun(scheduled_hours: float, plant_id: str = PLANT) -> dict[str, Any]:
+    """Compare a schedule's load against effective capacity. The capacity
+    floor: a schedule the floor physically cannot run is not auto-releasable.
+    """
+    cap = line_capacity(plant_id)
+    eff = float(cap.get("effective_capacity_hours") or 0)
+    over = max(0.0, float(scheduled_hours or 0) - eff)
+    return {
+        "scheduled_hours": round(float(scheduled_hours or 0), 2),
+        "effective_capacity_hours": eff,
+        "overrun_hours": round(over, 2),
+        "exceeds_capacity": over > 0,
+    }

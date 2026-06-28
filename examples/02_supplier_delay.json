@@ -1,0 +1,16 @@
+{
+  "_entry_point": "supplier_signal",
+  "_description": "Tier-1 supplier announces 7-day delay on resin \u2014 supplier_signal_agent re-plans against constrained supply.",
+  "payload": {
+    "signal_id": "supp-2026-0612-resin",
+    "plant_id": "plant-portland-01",
+    "supplier_id": "supp-polymer-co",
+    "material": "polymer_resin_grade_A",
+    "expected_delay_days": 7,
+    "affected_orders": 4,
+    "alternative_suppliers": [
+      "supp-eastasia-resin",
+      "supp-eu-chem"
+    ]
+  }
+}

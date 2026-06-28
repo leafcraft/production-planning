@@ -1,0 +1,12 @@
+{
+  "_entry_point": "manual_action",
+  "_description": "Weekly demand sense \u2014 scheduler builds the 7-day plan, no constraints fire.",
+  "payload": {
+    "plant_id": "plant-portland-01",
+    "signal_source": "weekly_review",
+    "planning_window_days": 7,
+    "demand_forecast_units": 12400,
+    "current_capacity_units": 13200,
+    "starting_inventory_units": 2100
+  }
+}
