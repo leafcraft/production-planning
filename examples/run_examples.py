@@ -17,6 +17,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import agency.tools  # noqa: F401 — registers @global_tool tools before start()
 # WORM audit sink — registered on the SDK instance below (same as main.py)
 from agency._shared import audit_logger as _audit_logger
 
@@ -29,7 +30,7 @@ EXAMPLES_DIR = Path(__file__).parent
 async def run_scenario(sdk: LeafMesh, scenario_path: Path) -> None:
     scenario = scenario_path.stem
     payload = json.loads(scenario_path.read_text())
-    entry_point = payload.pop("_entry_point", "manual_action")
+    entry_point = payload.pop("_entry_point", "demand_signal")
     description = payload.pop("_description", "")
     print()
     print("=" * 78)

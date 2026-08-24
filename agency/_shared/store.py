@@ -1,23 +1,27 @@
-"""Dev-mode store for production planning.
+"""Dev-mode store for the production-planning pod.
 
-Stands in for the plant's systems of record so the FULL chain runs
-end-to-end before any connector is wired:
+A DEV STAND-IN, not a system of record. It stands in for the plant's
+real systems so the FULL pod runs end-to-end before any connector is
+wired:
   * MES / ERP work-centre calendar → line/shift/equipment capacity
   * ERP / MRP                        → BOM + on-hand inventory
   * supplier master                 → lead times, alternates, signals
   * the current released schedule    → what's on the floor right now
 
-Replace each read with the matching MCP connector in prod; the function
-signatures are the contract. The integration points (do nothing until
-the calls here are wired):
-  * MES_MCP_URL          → line_capacity()         (capacity_model_agent)
-  * ERP_MRP_MCP_URL      → bom() / on_hand()       (material_requirements_agent)
-  * MES_HISTORIAN_MCP_URL→ analytics rollups       (planning_analytics_agent)
-Setting those env vars alone does nothing until you wire the calls here.
+Per the doctrine (where-data-lives): a real store enforces its own
+invariants — this file does not, so it is dev only. **The function
+signatures are the contract you swap real systems into** — the pod does
+not change. Every read that has no seed **announces itself**
+(`available: false` + a reason), never a confident empty result.
 
-Single-process JSON files under ./data — survives the HITL wait because
-the mesh is one process. Swap for the Redis/Postgres session store at
-multi-replica scale; the get/put interface stays the same.
+To go live: swap each read below for the matching MCP connector (see the
+commented `mcp:` block in configs/config.yaml) and point `.env` at
+`MES_MCP_URL` / `ERP_MRP_MCP_URL`. Setting the env vars alone does
+nothing until the reads here are wired.
+
+Single-process JSON under ./data (survives the HITL wait — the mesh is
+one process). Swap for the Redis/Postgres session store at multi-replica
+scale; the get/put interface stays the same.
 """
 from __future__ import annotations
 
@@ -176,6 +180,84 @@ def current_schedule(plant_id: str = PLANT) -> dict[str, Any]:
     return _seeded("schedule", _SEED_SCHEDULE)
 
 
+# ── Per-line reads + atomic line claim (instances line fan-out) ──────
+# demand_sensor_agent runs `instances: N` copies; each copy CLAIMS one
+# line atomically so the copies read DISJOINT lines instead of all
+# reading the same thing (see nuances "Parallel instances").
+_CLAIM_LOCK = threading.Lock()
+_CLAIM_STATE: dict[str, list[str]] = {}
+
+
+def line_ids(plant_id: str = PLANT) -> list[str]:
+    return [l["line_id"] for l in line_capacity(plant_id).get("lines", [])]
+
+
+def claim_line(plant_id: str = PLANT) -> dict[str, Any]:
+    """Atomically claim the next unclaimed line for the plant (LPOP-style).
+
+    Dev stand-in for a Redis `LPOP` / `UPDATE … SKIP LOCKED RETURNING` —
+    the copies of demand_sensor call this to split the line backlog. The
+    backlog refills once a cycle is spent. Announces `available: false`
+    when there is genuinely nothing left to claim.
+    """
+    with _CLAIM_LOCK:
+        q = _CLAIM_STATE.get(plant_id)
+        if not q:                       # refill a spent cycle
+            q = line_ids(plant_id)
+        if not q:
+            return {"available": False, "reason": f"no lines configured for {plant_id!r}"}
+        line_id = q.pop(0)
+        _CLAIM_STATE[plant_id] = q
+        return {"available": True, "plant_id": plant_id, "line_id": line_id, "remaining": len(q)}
+
+
+def _line_record(plant_id: str, line_id: str) -> dict[str, Any] | None:
+    return next((l for l in line_capacity(plant_id).get("lines", [])
+                 if l.get("line_id") == line_id), None)
+
+
+def read_line_demand(plant_id: str, line_id: str) -> dict[str, Any]:
+    """The demand this line is responsible for (its SKUs). PROD: ERP demand view."""
+    line = _line_record(plant_id, line_id)
+    if not line:
+        return {"available": False, "reason": f"unknown line {line_id!r} at {plant_id!r}"}
+    skus = set(line.get("skus", []))
+    dem = demand_picture(plant_id)
+    items = [d for d in dem.get("sku_demands", []) if d.get("sku") in skus]
+    return {"available": True, "plant_id": plant_id, "line_id": line_id,
+            "sku_demands": items, "planning_window_days": dem.get("planning_window_days", 14)}
+
+
+def read_line_capacity(plant_id: str, line_id: str) -> dict[str, Any]:
+    """This line's effective capacity + maintenance windows. PROD: MES calendar."""
+    line = _line_record(plant_id, line_id)
+    if not line:
+        return {"available": False, "reason": f"unknown line {line_id!r} at {plant_id!r}"}
+    cap = line_capacity(plant_id)
+    window = float(demand_picture(plant_id).get("planning_window_days", 14))
+    shifts = line.get("shifts", [])
+    windows = [w for w in cap.get("planned_maintenance_windows", []) if w.get("line_id") == line_id]
+    gross = 8.0 * len(shifts) * window
+    effective = round(max(0.0, gross - 16.0 * len(windows)), 2)   # ~1 shift lost per maint window
+    return {"available": True, "plant_id": plant_id, "line_id": line_id,
+            "units_per_hour": line.get("units_per_hour", 0),
+            "shifts": shifts,
+            "is_bottleneck": line_id in cap.get("bottleneck_lines", []),
+            "effective_capacity_hours": effective,
+            "maintenance_windows": windows}
+
+
+def list_prior_schedules(plant_id: str = PLANT) -> dict[str, Any]:
+    """Prior schedule ids for this plant, for duplicate/regression checks.
+    PROD: MES release history."""
+    prior = [current_schedule(plant_id).get("schedule_id", "")]
+    for rec in _load("outbox") or []:
+        sid = rec.get("schedule_id")
+        if sid and sid not in prior:
+            prior.append(sid)
+    return {"available": True, "plant_id": plant_id, "prior_schedule_ids": prior}
+
+
 # ── Domain math the gate floors rely on (deterministic, no LLM) ──────
 def material_shortfalls(sku_demands: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Explode demand × BOM against on-hand minus safety stock and return
@@ -228,3 +310,47 @@ def capacity_overrun(scheduled_hours: float, plant_id: str = PLANT) -> dict[str,
         "overrun_hours": round(over, 2),
         "exceeds_capacity": over > 0,
     }
+
+
+# ── The pod's own outbox + append-only ledger + finisher recovery ────
+# NOT a system of record — the dev mirror of the MES push + the WORM
+# ledger, so the finisher (release_agent) produces a VERIFIABLE record
+# day-0 without a real MES, and can dedupe a double-release.
+def record_outbox(entry: dict[str, Any]) -> dict[str, Any]:
+    with _LOCK:
+        outbox = _load("outbox") or []
+        rec = {"recorded_at": _now(), **entry}
+        outbox.append(rec)
+        _save("outbox", outbox)
+    return rec
+
+
+def append_ledger(entry: dict[str, Any]) -> dict[str, Any]:
+    """Append-only planning ledger (dev mirror of the WORM sink)."""
+    with _LOCK:
+        ledger = _load("planning_ledger") or []
+        rec = {"recorded_at": _now(), **entry}
+        ledger.append(rec)
+        _save("planning_ledger", ledger)
+    return rec
+
+
+def put_approved_schedule(schedule_id: str, pack: dict[str, Any]) -> None:
+    """Persist an approved/released schedule so the finisher can recover it
+    post-HITL and detect a double-release."""
+    if not schedule_id:
+        return
+    with _LOCK:
+        store = _load("approved_schedules") or {}
+        store[schedule_id] = {"stored_at": _now(), **pack}
+        _save("approved_schedules", store)
+
+
+def get_approved_schedule(schedule_id: str) -> dict[str, Any]:
+    return (_load("approved_schedules") or {}).get(schedule_id, {})
+
+
+def mes_wired() -> bool:
+    """True if a real MES release connector is configured."""
+    import os
+    return bool(os.getenv("MES_MCP_URL"))

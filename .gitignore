@@ -8,6 +8,7 @@ __pycache__/
 logs/
 *.log
 data/
+out/
 .DS_Store
 .idea/
 .vscode/

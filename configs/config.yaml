@@ -1,823 +1,533 @@
-# production-planning — Production Planning & Scheduling
+# production-planning — Production-Planning Pod
 #
-# Demand sense → schedule re-optimization → constraint flag → release.
-# Rule 1: team. Multi-entry (demand signal, capacity change, scheduled
-# re-opt, manual). Planners govern major changes; routine
-# re-optimizations run agent-side.
+# A pod of digital employees + human plant roles that runs a production
+# schedule change end to end: a signal arrives -> the operating picture is
+# sensed line-by-line (confidence-scored) -> the sequence is re-optimised
+# -> a DETERMINISTIC gate decides auto-release vs human review -> a planner
+# (then plant manager, then ops director) decides the exceptions -> the
+# finisher pushes the approved schedule to the MES and fails closed -> the
+# WORM sink records every release and intervention.
 #
-# WHY LEAFMESH — prod × goods, COGS, cost, pool 14% of revenue,
-# routine 70%, internal visibility. Planners spend loaded hours
-# rebuilding schedules every cycle; agents carry the routine.
+# The pod is a TEAM, not a pipeline. Every wire is conditional; every
+# hand-off is a finished contract; every human gate default-denies on
+# silence; the finisher produces the real artifact and fails closed; the
+# WORM sink is the terminus. Systems (MES / ERP / MRP) are TOOLS inside
+# agents, never members.
+#
+# Design doctrine: .claude/skills/leafmesh/building-agents-thoroughly.md
+# Field reference:  .claude/skills/leafmesh/agent-config-fields.md
 
 name: "production-planning"
-version: "1.0.0"
-architecture: "managed_mesh"
-environment: "development"
+version: 1.0.0
+architecture: managed_mesh
+environment: development
 debug: true
-log_level: "INFO"
+log_level: INFO
 
-redis:
-  host: "${REDIS_HOST:localhost}"
-  port: ${REDIS_PORT:6379}
-  db: 0
-  password: "${REDIS_PASSWORD:}"
-  auto_storage: true
-  decode_responses: true
-  default_ttl: 86400
-  session_ttl: 604800
+persistence:
+  backend: redis
+  redis:
+    host: "${REDIS_HOST:localhost}"
+    port: ${REDIS_PORT:6379}
+    password: "${REDIS_PASSWORD:}"
 
 auto_discover:
-  directory: "./agency"
-  pattern: "*_agent.py"
-  recursive: false
+  directory: ./agency
+  pattern: '*_agent.py'
 
+# The Manager is the SUPERVISOR — it watches every hand-off and escalates
+# stalls / contract violations / repeated errors to the Ops Director. It is
+# not a router in the middle of the team.
 manager:
-  enabled: true
-  model: "gpt-4o-mini"
-  domain: "generic"
-  can_intervene: true
-
+  model: gpt-4o-mini
+  domain: generic
   prompt: |
-    This mesh runs production planning + scheduling. A successful turn:
-      - demand_sensor pulls forecast + actuals
-      - capacity_model checks line / shift / equipment availability
-      - scheduler_agent (re-)optimises the production sequence
-      - constraint_flagger surfaces conflicts (material shortage,
-        capacity bottleneck, deadline miss)
-      - if conflicts found → planner_human decides
-      - clean re-opts auto-release to MES
-
-    Escalate when:
-      - constraint_flagger reports unresolvable shortage
-      - schedule changes affect on-time delivery for a top-20 SKU
-      - same conflict pattern recurs across 3+ shifts
-      - safety_stock floor would be breached
-
-    Watch for:
-      - chronic bottleneck patterns (same line, same shift)
-      - demand vs capacity drift > 15% over rolling 14 days
-      - planner intervention rate trending up (signals upstream issue)
-
+    This mesh runs production planning + scheduling. A successful change
+    flows demand+capacity sensed line-by-line (Sensa) -> re-optimised
+    (Rex) -> the deterministic auto-release gate (Gaia) -> a clean re-opt
+    auto-releases to the MES (Milo, the finisher); a flagged one goes to a
+    planner. Escalate to the Ops Director when: a re-optimisation loops on
+    a cross-check discrepancy past its bound, a safety-stock floor would be
+    breached, an approval round times out, or any agent hands off a
+    malformed schedule. Silence never advances a release.
   routing:
-    mode: "learning"
-    memory_size: 200
-    confidence_threshold: 0.7
-    fallback: "all"
-    decay_days: 30
-
-  knowledge:
-    serviceName: "mongo_main"
-    enabled: true
-    groupName: "planning_playbook"
-
+    mode: static
   escalation:
     targets:
-      - type: "human_agent"
-        agent: "ops_director_human"
-      - type: "webhook"
-        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
-        method: "POST"
-        headers:
-          Content-Type: "application/json"
-        payload_template:
-          incident_id: "{{schedule_id}}"
-          severity: "{{severity}}"
-          message: "{{message}}"
-          session_id: "{{session_id}}"
-      - type: "channel"
-        provider: "slack"
-        channel_id: "${SLACK_PLANT_CHANNEL:}"
-        message_template: "[planning] {{message}} — schedule {{schedule_id}} (session {{session_id}})"
-
+      - type: human_agent
+        agent: ops_director_human
+      # - type: webhook
+      #   url: "${PAGER_WEBHOOK:}"
+      # - type: channel
+      #   provider: slack
+      #   channel_id: "${SLACK_PLANT_CHANNEL:}"
     auto_escalate:
-      max_retries: 2
-      max_errors_per_session: 3
+      max_retries: 3
+      max_errors_per_session: 5
       timeout_threshold: 2
 
-  health_check_interval: 60
-  agent_timeout_threshold: 300
-  chain_completion_timeout: 600
-
 mesh:
-  call_timeout: 120
+  call_timeout: 150
 
-data_structures:
-  PlanEvent:
-    type: "object"
-    properties:
-      schedule_id: { type: "string" }
-      plant_id: { type: "string" }
-      line_id: { type: "string" }
-      signal_source: { type: "string" }      # demand | capacity | scheduled | manual
-      planning_window_days: { type: "number" }
-      received_at_utc: { type: "string" }
-      raw_payload: { type: "object" }
-    required: ["plant_id", "signal_source"]
+# 2.4.131 runtime block — the ONE non-default this pod genuinely needs:
+# Rex re-optimises as a super_agent (plan/execute/verify) and can run long.
+# Everything else stays default (omission is meaningful).
+timeouts:
+  llm_hard_timeout_s: 300
 
+# ── Entry points — one per real-world trigger ────────────────────────────────
 entry_points:
-  - name: "demand_signal"
-    target: "demand_sensor_agent"
-    description: "New demand forecast OR actual order shifts demand picture"
-
-  - name: "capacity_change"
-    target: "capacity_model_agent"
-    description: "Line down / shift change / equipment maintenance event"
-
-  - name: "scheduled_reopt"
-    target: "scheduler_agent"
-    description: "Cron-driven periodic re-optimization"
-
-  - name: "manual_action"
-    target: "scheduler_agent"
-    description: "Planner-initiated re-opt"
-
-  - name: "mrp_compute"
-    target: "material_requirements_agent"
-    description: "Compute material requirements from demand × BOM"
-
-  - name: "shift_kpi_ingest"
-    target: "planning_analytics_agent"
-    description: "Record one shift KPI row (ingest mode)"
-
-  - name: "production_kpi_report"
-    target: "planning_analytics_agent"
-    description: "Read OEE / availability / quality rollups (report mode)"
-
-  - name: "supplier_signal"
-    target: "supplier_signal_agent"
-    description: "Supplier delay/quality/capacity webhook"
-
-  - name: "supplier_capacity_change"
-    target: "supplier_signal_agent"
-    description: "Supplier announces capacity reduction — re-plan against new ceiling"
-
-  - name: "raw_material_shortage"
-    target: "supplier_signal_agent"
-    description: "Commodity-level shortage alert — multi-supplier impact assessment"
-
-  - name: "shortage_alert"
-    target: "constraint_flagger_agent"
-    description: "Material shortage / supplier delay webhook"
-
-
-# ── Direct-call entry points (every non-human, non-terminal
-#    agent is API-addressable; bypasses the upstream chain).
-#    Use for ad-hoc invocation, debugging, programmatic ingest.
-  - name: "direct_call_release"
-    target: "release_agent"
-    description: "On-demand direct call to release (programmatic) — bypasses upstream chain"
-
-  - name: "direct_call_rolling_reopt_orchestrator"
-    target: "rolling_reopt_orchestrator_agent"
-    description: "On-demand direct call to rolling_reopt_orchestrator (programmatic) — bypasses upstream chain"
-
-  # ── Lyzr-inspired agents (added in 2.3.x) ──
-  - name: "capacity_what_if_run"
-    target: "capacity_what_if_agent"
-    description: "Scenario sim — add_shift / line_down / demand_spike / supplier_outage etc."
-
-  - name: "demand_forecast_backtest"
-    target: "planning_analytics_agent"
-    description: "Backtest forecasts vs actuals → MAPE/bias/tracking-signal + model recommendations per SKU (backtest mode)"
-
+  - name: demand_signal
+    target: plan_coordinator_agent
+    description: "A new forecast or actual-order shift arrives — the coordinator opens a change case."
+    condition: always
+  - name: capacity_change
+    target: plan_coordinator_agent
+    description: "A line goes down / a shift changes / equipment maintenance — the coordinator opens a case."
+    condition: always
+  - name: schedule_status
+    target: plan_coordinator_agent
+    description: "Anyone asks 'where is my schedule?' — the coordinator answers from the case record."
+    condition: always
+  - name: daily_sweep
+    target: demand_sensor_agent
+    description: "Scheduled line-by-line re-sense of demand vs capacity across the plant."
+    condition: always
+  - name: supplier_signal
+    target: supplier_signal_agent
+    description: "A supplier delay / quality / capacity / force-majeure signal arrives."
+    condition: always
+  - name: planner_reply
+    target: planner_human
+    description: "HITL resume — a planner answers a review or approves a schedule."
+    condition: always
 
 agents:
 
-  demand_sensor_agent:
-    name: "demand_sensor_agent"
-    agent_type: "llm"
-    description: "Pulls demand forecast + actuals, produces a planning-ready demand picture"
-    model: "gpt-4o-mini"
-    temperature: 0.0
-    max_tokens: 800
-    communication_type: "chain"
-
-    prompt: |
-
-
-      You are the demand planner. context["prepared_data"] carries the
-      planning-ready demand picture already pulled from the plant's demand
-      systems (pre_compose did this) — sku_demands, planning_window_days,
-      notable_shifts. Reason over the real numbers; don't invent SKUs.
-
-      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
-
-      {"sku_demands": [], "confidence": 0, "notable_shifts": []}
-      Build the demand picture for the planning window:
-        - sku_demands: list of {sku, units, due_date, customer_segment}
-        - confidence: 0..1
-        - notable_shifts: changes vs prior period
-
-    enforce_yields: true
-    enforce_yields_retry: 2
-
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "demand_signals"
-
-    yields:
-      sku_demands: "list"
-      confidence: "number"
-      notable_shifts: "list"
-
-    inputs:
-      payload: "object"
-
-    can_call:
-      - agent: "capacity_model_agent"
-
-    auto_store_response: true
-    auto_store_yields: true
-
-  capacity_model_agent:
-    name: "capacity_model_agent"
-    agent_type: "programmatic"
-    description: "Reads line / shift / equipment availability from your MES (or ERP work-centre calendar)"
-    communication_type: "chain"
-
-    # ── YOUR SYSTEM OF RECORD ────────────────────────────────────
-    # Line + shift capacity lives in your MES / ERP work-centre
-    # calendar, not in this template. Point this connector at an MCP
-    # gateway (or swap integration to n8n/zapier) that returns the
-    # yields below.
-    integration: "mcp"
-    connector_config:
-      transport: "http"
-      url: "${MES_MCP_URL:}"            # your MES / ERP MCP gateway
-      tool_name: "get_line_capacity"    # must return the yields below
-      timeout: 30
-
-    yields:   # ← contract your MES connector must return
-      total_capacity_hours: "number"
-      bottleneck_lines: "list"
-      planned_maintenance_windows: "list"
-      effective_capacity_hours: "number"
-
-    inputs:
-      upstream_yields: "object"
-
-    can_call:
-      - agent: "scheduler_agent"
-
-    auto_store_response: true
-    auto_store_yields: true
-
-  scheduler_agent:
-    name: "scheduler_agent"
-    agent_type: "llm"
-    description: "Re-optimises the production sequence against demand + capacity"
-    model: "claude-sonnet-4-6"
+  # ─────────────────────────────────────────────────────────────────────────
+  # Nova — Plan Coordinator (AI). Owns each schedule-change case end to end:
+  # opens it, orchestrates the pod, keeps live status, is the planner's one
+  # contact. Pure orchestration — never senses demand, never schedules, never
+  # approves. (Pure YAML.)
+  # ─────────────────────────────────────────────────────────────────────────
+  plan_coordinator_agent:
+    name: plan_coordinator_agent
+    communication_type: chain
+    agent_type: llm
+    model: gpt-4o-mini
     temperature: 0.1
-    max_completion_tokens: 3000
-    communication_type: "chain"
-
-    # Fan-in: requires demand + capacity
-    wait_for: "demand_sensor_agent AND capacity_model_agent"
-    wait_for_timeout: 60
-
+    description: "Plan Coordinator — opens the change case, orchestrates, keeps status, single point of contact."
     prompt: |
+      You are Nova, the Plan Coordinator. You OWN each production-schedule
+      change from the moment a signal arrives to the moment it is released.
+      You orchestrate the pod and keep the planner informed — you never
+      sense demand, re-optimise a schedule, or approve anything yourself.
 
-
-      You are the production scheduler. context["prepared_data"] carries the
-      full operating picture pulled before you ran (pre_compose): line/shift
-      capacity (effective_capacity_hours, bottleneck_lines, maintenance
-      windows), the current schedule on the floor, and the BOM / on-hand
-      materials. The demand picture arrives fanned-in from demand_sensor.
-      Re-sequence against the REAL capacity and current schedule.
+      On a new demand or capacity signal: open a case, record the plant and
+      the time, hand it to the demand sensor. On a status ask: answer the
+      current stage / waiting-on / next gate from the case record — nothing
+      invented. Route anything you cannot place to the Ops Director; never
+      make the plant call yourself.
 
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
-
-      {"sequenced_orders": [], "on_time_delivery_pct": 0, "unmet_demand": [], "confidence": 0, "schedule_id": "", "planner_briefing": ""}
-      Re-optimise the production schedule for the window. Return JSON
-      with these keys:
-        - sequenced_orders: ordered list of {sku, units, line_id,
-          shift_id, start_utc, end_utc}
-        - on_time_delivery_pct: 0..1
-        - unmet_demand: list of {sku, units_short, reason}
-        - confidence: 0..1
-        - schedule_id: a unique ID for this schedule
-        - planner_briefing: 3-4 sentence narrative for the planner.
-          Lead with on-time-delivery %, note any unmet demand and the
-          top reason, and recommend whether the planner needs to
-          intervene OR auto-release is safe.
-
-    enforce_yields: true
-    enforce_yields_retry: 2
-
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "scheduling_model"
-
+      {"action": ..., "schedule_id": ..., "plant_id": ..., "stage": ..., "waiting_on": ..., "summary": ...}
     yields:
-      sequenced_orders: "list"
-      on_time_delivery_pct: "number"
-      unmet_demand: "list"
-      confidence: "number"
+      action: "string"        # open_case | status | escalate
       schedule_id: "string"
-      planner_briefing: "string"
-
-    inputs:
-      upstream_yields: "object"
-
+      plant_id: "string"
+      stage: "string"
+      waiting_on: "string"
+      summary: "string"
     can_call:
-      - agent: "constraint_flagger_agent"
+      - agent: demand_sensor_agent
+        condition: "calling_agent_response.action == 'open_case'"
+      - agent: ops_director_human
+        condition: "calling_agent_response.action == 'escalate'"
 
-    auto_store_response: true
-    auto_store_yields: true
+  # ─────────────────────────────────────────────────────────────────────────
+  # Sensa — Demand & Capacity Sensor (AI). Senses the operating picture
+  # line-by-line: claims a line, reads its demand and capacity, scores every
+  # SKU's confidence, and REFUSES to guess. A SKU it cannot read with
+  # confidence is flagged, never a made-up number in a schedule.
+  #   instances: 3  → three copies sweep the plant's lines in parallel;
+  #   claim_line    → each copy claims a DIFFERENT line (no duplicate work).
+  # @chain re-averages confidence across the copies (instances SUM numbers —
+  # a footgun for a ratio) and enforces the confidence floor.
+  # ─────────────────────────────────────────────────────────────────────────
+  demand_sensor_agent:
+    name: demand_sensor_agent
+    communication_type: chain
+    agent_type: llm
+    model: gpt-4o-mini
+    temperature: 0.1
+    max_tool_calls_per_message: 12   # claim + read demand + read capacity per line; default 5 truncates silently
+    description: "Demand & Capacity Sensor — claims a line, reads its demand + capacity, scores confidence, refuses to guess."
+    # Line fan-out: 3 copies per activation, each claims a disjoint line.
+    instances: 3
+    instances_handoff: last          # COMBINE the copies and route once
+    # Scheduled sweep — daily, in the plant's timezone (NOT UTC). Also
+    # reachable via the daily_sweep entry point.
+    wake_up: "0 6 * * *"
+    timezone: "America/Los_Angeles"
+    wake_up_input:
+      trigger: daily_sweep
+    prompt: |
+      You are Sensa, the Demand & Capacity Sensor. Your job is to turn a
+      production line into a confidence-scored demand-and-capacity picture —
+      and to REFUSE to guess. FIRST call claim_line to claim ONE line (each
+      parallel copy of you claims a different line). Then read that line's
+      demand and its capacity, and score every SKU's demand 0-1.
 
-  constraint_flagger_agent:
-    name: "constraint_flagger_agent"
-    agent_type: "programmatic"
-    description: "Flags conflicts: unresolvable shortages, deadline misses, safety_stock breaches"
-    communication_type: "chain"
+      NEVER invent a SKU, a unit count, or a due date no source shows. A SKU
+      you cannot read with confidence goes in low_confidence_skus and keeps
+      the picture un-clean — it is never a silent guess downstream. Report
+      the line's effective capacity in lines_read. Load the `sensing`
+      playbook for the exact claim-then-read order.
 
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"picture_clean": ..., "plant_id": ..., "schedule_id": ..., "sku_demands": ...,
+       "lines_read": ..., "low_confidence_skus": ..., "lines_claimed": ..., "confidence": ..., "notes": ...}
     yields:
-      conflicts: "list"                  # [{type, severity, summary}]
+      picture_clean: "boolean"
+      plant_id: "string"
+      schedule_id: "string"
+      sku_demands: "array"
+      lines_read: "array"          # per-line {line_id, effective_capacity_hours, is_bottleneck}
+      low_confidence_skus: "array"
+      lines_claimed: "number"      # SUMS across instances — correct (count of lines this sweep claimed)
+      confidence: "number"         # re-averaged in @chain (SUM would be wrong for a ratio)
+      notes: "string"
+    # Playbook — the CRAFT, fetched on demand. Only `description` rides in the
+    # prompt; `responsibility` is loaded when the model recognises the intent.
+    playbook:
+      - intent: sensing
+        description: "How to claim a line and read its demand + capacity without guessing."
+        responsibility: |
+          1. Call claim_line(plant_id) ONCE. If available:false, you have no
+             line to sense — return picture_clean:false with a note; do NOT
+             read another copy's line.
+          2. read_line_demand(plant_id, line_id) and
+             read_line_capacity(plant_id, line_id) for the CLAIMED line only.
+          3. Score every SKU's demand 0-1 against how legibly the source
+             gave units + due date. Anything below 0.85, or any SKU the read
+             marked unavailable, goes in low_confidence_skus.
+          4. Put the line's effective_capacity_hours + is_bottleneck in
+             lines_read. Set lines_claimed to 1 when you claimed a line, 0
+             when claim_line returned available:false.
+        variables: [plant_id]
+    # Day-0 tool surface — reads the seed plant snapshot so the pod runs with
+    # NO connector wired. Each tool announces itself (available:false) when it
+    # has no real source. See agency/tools.py.
+    tools: [claim_line, read_line_demand, read_line_capacity, list_prior_schedules]
+    tool_categories: [planning]
+    # ── To wire real MES/ERP, uncomment and set the URLs (each named action
+    #    under `use:` becomes its own tool). NOTE: the SDK rejects an http mcp
+    #    block with an EMPTY url at load, so this ships commented — fill the
+    #    URL, then uncomment. ──
+    # mcp:
+    #   - transport: http
+    #     url: "${MES_MCP_URL}"
+    #     token: "${MES_MCP_TOKEN:}"
+    #     use: [get_line_capacity, get_maintenance_windows]
+    #     name: mes
+    #     timeout: 30
+    #   - transport: http
+    #     url: "${ERP_MRP_MCP_URL}"
+    #     token: "${ERP_MRP_MCP_TOKEN:}"
+    #     use: [get_line_demand, run_mrp_explosion]
+    #     name: erp
+    #     timeout: 30
+    can_call:
+      - agent: scheduler_agent
+        condition: "calling_agent_response.picture_clean == true"
+      - agent: ops_director_human
+        condition: "calling_agent_response.picture_clean == false"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Rex — Production Scheduler (AI, Super-Agent). Re-optimises the sequence
+  # from Sensa's verified picture across lines + shifts, computes on-time
+  # delivery, writes the planner briefing, and renders the draft schedule to
+  # ./out. super_agent = autonomous plan/execute/verify over a multi-line
+  # re-opt. @chain = the cross-check floor (fail closed) + the pre-gate stash
+  # + a BOUNDED back-edge counter (never loop re-sensing forever).
+  # ─────────────────────────────────────────────────────────────────────────
+  scheduler_agent:
+    name: scheduler_agent
+    communication_type: chain
+    agent_type: llm
+    model: claude-sonnet-4-6
+    temperature: 0.1
+    description: "Production Scheduler — re-optimises the sequence from the verified picture, cross-checks, briefs the planner."
+    super_agent:                     # dict form = the tuning path (2.4.123+)
+      cost_ceiling: 120000
+      wall_clock: 900
+    prompt: |
+      You are Rex, the Production Scheduler. Turn Sensa's verified
+      demand-and-capacity picture into an optimised production sequence
+      across the plant's lines and shifts. Cross-check every order's units,
+      line, shift and due date against the source picture BEFORE anyone sees
+      the schedule. Lead the planner_briefing with on-time-delivery %, name
+      any unmet demand and its top reason, and say whether auto-release is
+      safe or the planner should look. If a cross-check does not tie out,
+      return it to Sensa with the specific discrepancy — never force an order
+      to fit. Load the `reoptimize` playbook for the assembly + cross-check
+      order.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"schedule_built": ..., "cross_check_ok": ..., "discrepancy": ..., "reopt_retry_exhausted": ...,
+       "sequenced_orders": ..., "on_time_delivery_pct": ..., "unmet_demand": ...,
+       "schedule_id": ..., "confidence": ..., "planner_briefing": ...}
+    yields:
+      schedule_built: "boolean"
+      cross_check_ok: "boolean"
+      discrepancy: "string"
+      reopt_retry_exhausted: "boolean"   # loop guard for the back-edge to Sensa
+      sequenced_orders: "array"
+      on_time_delivery_pct: "number"
+      unmet_demand: "array"
+      schedule_id: "string"
+      confidence: "number"
+      planner_briefing: "string"
+    playbook:
+      - intent: reoptimize
+        description: "How to re-sequence the schedule and cross-check it against the source."
+        responsibility: |
+          1. Sequence each SKU onto a line that can make it, within its
+             shifts, before its due date. Keep every order traceable to the
+             sensed demand it came from.
+          2. Re-check units, line, shift and due dates against the picture.
+             If an order references a SKU or line the picture did not sense,
+             or its units exceed the line's effective capacity, that is a
+             cross-check discrepancy — return it to Sensa; do NOT adjust a
+             number to make it fit.
+          3. Compute on_time_delivery_pct and list any unmet_demand with a
+             reason (use "safety_stock" / "shortage" / "supplier" in the
+             reason when that is the cause — the gate reads it).
+          4. Mint a schedule_id and write the planner_briefing.
+        variables: [schedule_id]
+    can_call:
+      # Bounded back-edge — re-sense only until the exhaustion flag trips.
+      - agent: demand_sensor_agent
+        condition: "calling_agent_response.cross_check_ok == false and calling_agent_response.discrepancy != '' and calling_agent_response.reopt_retry_exhausted == false"
+      # Terminal route when re-sense retries are spent — NEVER loop again.
+      - agent: ops_director_human
+        condition: "calling_agent_response.cross_check_ok == false and calling_agent_response.reopt_retry_exhausted == true"
+      # Clean schedule → the deterministic gate.
+      - agent: constraint_flagger_agent
+        condition: "calling_agent_response.cross_check_ok == true"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Gaia — Auto-Release Gate (programmatic, DETERMINISTIC — never an LLM).
+  # The auto-release decision is irreversible plant action, so it is
+  # reproducible arithmetic a model may not waive. THREE floors: safety-stock
+  # / severity over unmet demand, material-availability (SKUs × BOM vs on-hand
+  # minus safety stock), and capacity (load vs effective hours). A safety
+  # breach → the plant manager; any other review → the planner; a clean re-opt
+  # → the finisher. See agency/constraint_flagger_agent.py.
+  # ─────────────────────────────────────────────────────────────────────────
+  constraint_flagger_agent:
+    name: constraint_flagger_agent
+    communication_type: chain
+    agent_type: programmatic
+    description: "Auto-Release Gate — three deterministic floors decide auto-release vs a human, reproducible math never an LLM."
+    yields:
+      conflicts: "array"                 # [{type, severity, summary}]
       safety_stock_breach: "boolean"
       requires_planner_review: "boolean"
       can_auto_release: "boolean"
-      schedule_id: "string"              # identity passthrough — planner_human inputs
-
-    inputs:
-      upstream_yields: "object"
-
-    narration: |
-      THREE deterministic floors ENFORCED in constraint_flagger_agent.py
-      (reproducible arithmetic — never an LLM):
-        1. SAFETY-STOCK / SEVERITY over scheduler unmet_demand: a
-           "safety_stock" reason → severity 1.0 + breach; "shortage"/
-           "supplier" → 0.8; else 0.6. Breach OR severity >= 0.7 →
-           requires_planner_review.
-        2. MATERIAL-AVAILABILITY: the scheduled SKUs are exploded × BOM
-           against on-hand minus safety stock (pulled via pre_compose);
-           any material that would breach its safety-stock floor is a
-           safety_stock_breach → requires_planner_review.
-        3. CAPACITY: a schedule whose load exceeds effective capacity
-           physically cannot run → severity 0.8 conflict.
-      can_auto_release=true ONLY when no floor fires AND every conflict is
-      below severity 0.5. (To gate on SKU tier, add the lookup to the
-      module — it must stay reproducible math.)
-
+      schedule_id: "string"              # identity passthrough — the human inbox renders it
     can_call:
-      # GATE POLICY (deterministic, computed in the module): planner
-      # review is FORCED when safety_stock is breached or any conflict
-      # has severity >= 0.7 — those schedules can NEVER auto-release.
-      - agent: "planner_human"
-        condition: "calling_agent_response.requires_planner_review == true"
-
-      # GATE POLICY: auto-release ONLY when no planner review is
-      # required AND every conflict is below severity 0.5 — the clean
-      # re-opt path straight to MES.
-      - agent: "release_agent"
+      # Safety-stock breach is the plant-manager's safety/quality call.
+      - agent: plant_manager_human
+        condition: "calling_agent_response.safety_stock_breach == true"
+      # Any other required review → the planner.
+      - agent: planner_human
+        condition: "calling_agent_response.requires_planner_review == true and calling_agent_response.safety_stock_breach == false"
+      # Clean re-opt → straight to the finisher (the gate IS the authorization).
+      - agent: release_agent
         condition: "calling_agent_response.can_auto_release == true"
 
-    auto_store_response: true
-    auto_store_yields: true
-
+  # ─────────────────────────────────────────────────────────────────────────
+  # Milo — MES Release Finisher (programmatic FINISHER / actuator). Sits
+  # BEHIND the gate + the human approval. It never approves — it RE-CHECKS
+  # authorization (an allow-token allowlist + block-token denylist; an
+  # unknown verdict fails closed; the gate's can_auto_release is the other
+  # authorized path), re-derives deterministic invariants (a schedule_id, real
+  # orders, no double-release), renders the release pack to ./out, DELETES the
+  # partial on a tripped floor, and records an append-only ledger entry. It
+  # recovers the schedule from the session stash / dev store across the HITL
+  # gate. See agency/release_agent.py.
+  # ─────────────────────────────────────────────────────────────────────────
   release_agent:
-    name: "release_agent"
-    agent_type: "programmatic"
-    description: "Releases the approved schedule to MES"
-    communication_type: "execute"
-
+    name: release_agent
+    communication_type: chain
+    agent_type: programmatic
+    description: "MES Release Finisher — re-checks authorization, renders the release pack, pushes to MES, fails closed, ledgers."
     yields:
+      released: "boolean"
       released_at_utc: "string"
       mes_job_id: "string"
-      released: "boolean"
-
-    inputs:
-      schedule_id: "string"
-
+      pack_path: "string"
+      status: "string"          # released | recorded_dev | blocked
+      block_reasons: "array"
     can_call:
-      - agent: "planning_audit_logger_agent"
+      - agent: planning_audit_logger_agent
+        condition: "always"
 
-  # ── Scheduled re-opt HEARTBEAT — pure-YAML no-op tick. The
-  # scheduled_reopt entry point targets scheduler_agent directly;
-  # this agent exists only to keep the 4-hourly cadence visible and
-  # observable (cron fires → tick is logged). No module, no
-  # integration, no downstream calls.
-  rolling_reopt_orchestrator_agent:
-    name: "rolling_reopt_orchestrator_agent"
-    agent_type: "programmatic"
-    description: "Every 4 hours — scheduled re-optimization heartbeat tick"
-    communication_type: "execute"
-    wake_up: "0 */4 * * *"
-
-    yields:
-      triggered_at_utc: "string"
-      plants_swept: "number"
-
-    inputs:
-      trigger: "string"
-
-    can_call: []
-
-  planner_human:
-    name: "planner_human"
-    agent_type: "human"
-    is_human_powered: true
-    description: "Production planner — decides on flagged schedule conflicts"
-    human_interface: "default"
-    communication_type: "dual"
-    human_timeout_seconds: 7200
-
-    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
-    #   gate to the SHARED inbox. Only set real operator emails: a
-    #   placeholder assigns tasks to a nonexistent operator and they
-    #   never appear in anyone's inbox.
-    fallback_on_timeout: true
-    fallback_response:
-      decision: "escalate_to_plant_manager"
-      message: "escalate_to_plant_manager"
-      note: "Planner didn't respond — plant manager escalation"
-
-    yields:
-      decision: "string"                 # approve | revise | escalate_to_plant_manager
-      notes: "string"
-
-    inputs:
-      schedule_id: "string"
-
-    can_call:
-      - agent: "release_agent"
-        condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'Approve' or calling_agent_response.human_message == 'Approved'"
-
-      - agent: "plant_manager_human"
-        condition: "calling_agent_response.human_message == 'escalate_to_plant_manager'"
-
-  plant_manager_human:
-    name: "plant_manager_human"
-    agent_type: "human"
-    is_human_powered: true
-    description: "Plant manager — operational tier-2 + safety/quality call"
-    human_interface: "default"
-    communication_type: "dual"
-    human_timeout_seconds: 14400
-
-    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
-    #   gate to the SHARED inbox. Only set real operator emails: a
-    #   placeholder assigns tasks to a nonexistent operator and they
-    #   never appear in anyone's inbox.
-    fallback_on_timeout: true
-    fallback_response:
-      decision: "escalate_to_ops_director"
-      message: "escalate_to_ops_director"
-      note: "Plant manager didn't respond — ops director escalation"
-
-    yields:
-      decision: "string"
-      notes: "string"
-
-    inputs:
-      schedule_id: "string"
-
-    can_call:
-      - agent: "release_agent"
-        condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'Approve' or calling_agent_response.human_message == 'Approved'"
-
-      - agent: "ops_director_human"
-        condition: "calling_agent_response.human_message == 'escalate_to_ops_director'"
-
-  ops_director_human:
-    name: "ops_director_human"
-    agent_type: "human"
-    is_human_powered: true
-    description: "Ops director — strategic escalation"
-    human_interface: "default"
-    communication_type: "dual"
-    human_timeout_seconds: 28800
-
-    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
-    #   gate to the SHARED inbox. Only set real operator emails: a
-    #   placeholder assigns tasks to a nonexistent operator and they
-    #   never appear in anyone's inbox.
-    fallback_on_timeout: true
-    fallback_response:
-      decision: "halt_for_review"
-      message: "halt_for_review"
-      note: "Ops director unavailable — schedule held"
-
-    yields:
-      decision: "string"
-      directive: "string"
-
-    inputs:
-      schedule_id: "string"
-
-    can_call:
-      - agent: "planning_audit_logger_agent"
-
-  planning_audit_logger_agent:
-    name: "planning_audit_logger_agent"
-    agent_type: "external"
-    description: "Hash-chained WORM audit of every release + intervention"
-    framework: "custom"
-    communication_type: "execute"
-
-    connector_config:
-      sink_type: "local_file"
-      local_file_path: "./logs/planning_audit.jsonl"
-
-    yields:
-      audit_event_id: "string"
-      written_at_utc: "string"
-      hash_chain_prev: "string"
-      hash_chain_current: "string"
-
-    inputs:
-      session_id: "string"
-      payload: "object"
-
-    can_call: []
-
-  # ────────────────────────────────────────────────────────────
-  # supplier_signal_agent — supplier delays → propagate to schedule
-  # Real plant pain: supplier slip the floor doesn't hear about
-  # until material is missing
-  # ────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # Sable — Supplier-Risk Analyst (AI). Ingests a supplier delay / quality /
+  # capacity / force-majeure signal, reasons over the supplier master and
+  # affected schedule, proposes alternates. @chain review floor re-derives
+  # requires_planner_review so an LLM can't under-rate a slip (force-majeure,
+  # severity floors, single-source). Routine → re-plan (scheduler); severe →
+  # the planner. See agency/supplier_signal_agent.py.
+  # ─────────────────────────────────────────────────────────────────────────
   supplier_signal_agent:
-    name: "supplier_signal_agent"
-    agent_type: "llm"
-    description: "Ingests supplier delay/quality signals; recommends schedule adjustments before the floor feels it"
-    model: "gpt-4o-mini"
+    name: supplier_signal_agent
+    communication_type: chain
+    agent_type: llm
+    model: gpt-4o-mini
     temperature: 0.1
-    max_tokens: 1000
-    communication_type: "chain"
-
+    max_tokens: 1200
+    description: "Supplier-Risk Analyst — ingests supplier signals, proposes alternates, forces a human on a slip it can't safely absorb."
     prompt: |
-
-
-      You are the supplier-risk analyst. context["prepared_data"] carries the
-      supplier master (reliability, alternates), the current schedule the
-      slip would hit, and on-hand materials — pulled before you ran
-      (pre_compose). Reason over the real alternates and lead times.
+      You are Sable, the Supplier-Risk Analyst. A supplier signal arrived
+      (delay, quality, capacity cut, force-majeure, or early delivery).
+      Reason over the supplier master and the schedule the slip would hit —
+      which production runs are affected and what to do. Be honest about
+      probability: supplier ETAs are often optimistic, so do not take them at
+      face value. Propose alternate suppliers where they exist. Load the
+      `supplier_triage` playbook for the review rules.
 
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
-
-      {"supplier_id": "", "signal_type": "", "affected_skus": [], "delay_days": 0, "propagation_summary": "", "alternate_supplier_options": [], "severity": 0, "requires_planner_review": false}
-      A supplier signal arrived (delay notice, quality issue, capacity
-      change, force-majeure). Return JSON with these keys:
-        - supplier_id: which supplier
-        - signal_type: delay | quality | capacity_cut | force_majeure | early_delivery
-        - affected_skus: list of affected SKU IDs
-        - delay_days: integer (negative if early delivery)
-        - propagation_summary: customer-ready summary of impact (which
-          production runs affected; suggested action)
-        - alternate_supplier_options: list of {supplier_id, lead_time_days, cost_delta_pct}
-        - severity: 0..1
-        - requires_planner_review: boolean — apply the hard rules below
-
-      Set "requires_planner_review" true when (a) severity >= 0.3 and
-      "alternate_supplier_options" is empty, (b) "signal_type" ==
-      force_majeure, or (c) severity >= 0.5. (These rules are ALSO
-      enforced deterministically in supplier_signal_agent.py's @chain
-      floor — including the single-source case — so the gate cannot be
-      under-rated even if you miss one.)
-
-      Be honest about probability. Supplier ETAs are often optimistic
-      — don't take them at face value.
-
-    enforce_yields: true
-    enforce_yields_retry: 1
-
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "supplier_master"
-
+      {"supplier_id": ..., "signal_type": ..., "affected_skus": ..., "delay_days": ...,
+       "propagation_summary": ..., "alternate_supplier_options": ..., "severity": ..., "requires_planner_review": ...}
     yields:
       supplier_id: "string"
-      signal_type: "string"
-      affected_skus: "list"
+      signal_type: "string"      # delay | quality | capacity_cut | force_majeure | early_delivery
+      affected_skus: "array"
       delay_days: "number"
       propagation_summary: "string"
-      alternate_supplier_options: "list"
+      alternate_supplier_options: "array"
       severity: "number"
       requires_planner_review: "boolean"
-
-    inputs:
-      supplier_signal: "object"
-
+    playbook:
+      - intent: supplier_triage
+        description: "When a supplier slip must go to a human vs be re-planned automatically."
+        responsibility: |
+          Force requires_planner_review true when (a) signal_type is
+          force_majeure, (b) severity >= 0.5, (c) severity >= 0.3 with no
+          alternate_supplier_options, or (d) the supplier is single-source
+          (no alternates in the master) and severity > 0. These are ALSO
+          re-derived deterministically in the @chain floor, so the gate
+          cannot be under-rated even if you miss one. Otherwise the slip can
+          be absorbed by an automatic re-plan.
+        variables: [supplier_id]
     can_call:
-      - agent: "planner_human"
+      - agent: planner_human
         condition: "calling_agent_response.requires_planner_review == true"
-
-      - agent: "scheduler_agent"
+      - agent: scheduler_agent
         condition: "calling_agent_response.requires_planner_review == false"
 
-  # ────────────────────────────────────────────────────────────
-  # material_requirements_agent — BOM × demand MRP explosion,
-  # answered by YOUR ERP / MRP system
-  # ────────────────────────────────────────────────────────────
-  material_requirements_agent:
-    name: "material_requirements_agent"
-    agent_type: "programmatic"
-    description: "Runs the MRP explosion (demand × BOM → raw-material requirements + shortages) in your ERP / MRP system"
-    communication_type: "chain"
+  # ─────────────────────────────────────────────────────────────────────────
+  # Human members — first-class, reached in the channel they already live in.
+  # Every gate DEFAULT-DENIES on timeout (fallback -> held_for_review -> audit).
+  # `dual` belongs on the human/boundary agents ONLY; AI specialists are chain.
+  # ─────────────────────────────────────────────────────────────────────────
 
-    # ── YOUR SYSTEM OF RECORD ────────────────────────────────────
-    # Bills of material and on-hand inventory live in your ERP / MRP
-    # (SAP, Oracle, NetSuite, Odoo…), not in this template. Point
-    # this connector at an MCP gateway (or swap integration to
-    # n8n/zapier) that runs the explosion and returns the yields
-    # below.
-    integration: "mcp"
-    connector_config:
-      transport: "http"
-      url: "${ERP_MRP_MCP_URL:}"        # your ERP / MRP MCP gateway
-      tool_name: "run_mrp_explosion"    # must return the yields below
-      timeout: 60
-
-    yields:   # ← contract your ERP/MRP connector must return
-      mode: "string"
-      requirements: "list"
-      shortages: "list"
-      has_critical_shortage: "boolean"
-      mrp_briefing: "string"
-    inputs:
-      mode: "string"
-      product_sku: "string"
-      material_sku: "string"
-      qty_per_unit: "number"
-      qty_on_hand: "number"
-      supplier_id: "string"
-      lead_time_days: "number"
-      demand_by_product: "object"
-    can_call: []
-
-    auto_store_response: true
-    auto_store_yields: true
-
-  # ────────────────────────────────────────────────────────────
-  # planning_analytics_agent — one analytics ROLE, two
-  # responsibilities (mode-dispatched by your historian):
-  #   1. per-shift OEE / availability / performance / quality
-  #      tracking (mode=ingest|report)
-  #   2. demand-forecast backtest (mode=backtest) —
-  #      MAPE/bias/tracking-signal per SKU → model recommendations
-  # Shift KPI rows and forecast-vs-actual history live in your MES
-  # historian / data warehouse, not in template SQLite.
-  # ────────────────────────────────────────────────────────────
-  planning_analytics_agent:
-    name: "planning_analytics_agent"
-    agent_type: "programmatic"
-    description: "Planning analytics — per-shift OEE/availability/performance/quality rollups + forecast backtests (MAPE/bias/tracking signal → model recommendations), answered by your MES historian"
-    communication_type: "chain"
-    # wake_up: "0 6 * * 1"   # enable after wiring your MES historian connector
-
-    # ── YOUR SYSTEM OF RECORD ────────────────────────────────────
-    # OEE rollups and forecast accuracy come from your MES historian
-    # (PI, Ignition, a lakehouse view…). Point this connector at an
-    # MCP gateway (or swap integration to n8n/zapier) that returns
-    # the yields below for the requested mode.
-    integration: "mcp"
-    connector_config:
-      transport: "http"
-      url: "${MES_HISTORIAN_MCP_URL:}"   # your MES historian MCP gateway
-      tool_name: "get_planning_analytics"  # must return the yields below
-      timeout: 60
-
-    yields:   # ← contract your historian connector must return
-      mode: "string"
-      # shift KPI / OEE tracking
-      line_id: "string"
-      horizon_days: "number"
-      recent: "object"
-      prior: "object"
-      oee_delta_pct_points: "number"
-      requires_pm_action: "boolean"
-      kpi_briefing: "string"
-      # demand forecast backtest
-      evaluations: "list"
-      evaluation_count: "number"
-      window_days: "number"
-      underperforming_skus: "list"
-      underperformer_count: "number"
-      requires_planner_review: "boolean"
-      evaluated_at_utc: "string"
-
-    inputs:
-      mode: "string"
-      line_id: "string"
-      shift_date: "string"
-      scheduled_mins: "number"
-      uptime_mins: "number"
-      target_units: "number"
-      actual_units: "number"
-      good_units: "number"
-      downtime_cause: "string"
-      horizon_days: "number"
-      forecast_vs_actual: "list"        # [{sku, forecast, actual, pattern}]
-      window_days: "number"
-
-    narration: |
-      OEE tracking: requires_pm_action=true when OEE drops more than
-      5 points vs the prior horizon — chronic same-line drops are the
-      bottleneck pattern the manager watches for.
-
-      MAPE targets by pattern:
-        smooth 8%, trending 12%, seasonal 15%, lumpy 30%, intermittent 50%.
-
-      Recommendations:
-        - rebias_model: |bias| > 0.15
-        - change_model_class: |tracking_signal| > 4
-        - increase_smoothing_weight: misses target but stable
-        - model_excellent: beats target by 50%
-
+  planner_human:
+    name: planner_human
+    agent_type: human
+    human_interface: webhook
+    communication_type: dual
+    human_timeout_seconds: 7200     # 2 hours to decide a flagged schedule / supplier review
+    description: "Production planner — decides flagged schedules and supplier reviews; approves release."
+    fallback_on_timeout: true
+    fallback_response:
+      human_decision: held
+      human_message: held_for_review
+    webhook_config:
+      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
+      outbound_headers: {Content-Type: "application/json"}
+      outbound_timeout: 30
+      max_retries: 1
+      retry_delay: 2
     can_call:
-      - agent: "planner_human"
-        condition: "calling_agent_response.requires_planner_review == true"
-
-    auto_store_response: true
-    auto_store_yields: true
-
-  # ────────────────────────────────────────────────────────────
-  # capacity_what_if_agent — production scenario simulator
-  # ────────────────────────────────────────────────────────────
-  capacity_what_if_agent:
-    name: "capacity_what_if_agent"
-    agent_type: "llm"
-    description: "Scenario simulator — what if we add a shift / lose a line / demand spikes 30%? Projects throughput + cost + schedule fit"
-    model: "claude-sonnet-4-6"
-    temperature: 0.1
-    max_completion_tokens: 2500
-    communication_type: "chain"
-
-    prompt: |
-
-
-      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
-
-      {"run_id": "", "scenario_type": "", "parameters": {}, "baseline_throughput": 0, "projected_throughput": 0, "throughput_delta_pct": 0, "cost_delta_cents": 0, "schedule_fit_pct": 0, "risk_flags": [], "recommendation": "", "requires_planner_review": false, "run_at_utc": ""}
-      Simulate the scenario. Return JSON with these keys:
-        - run_id: "whatif-<scenario_type>-<epoch seconds>" (e.g.
-            "whatif-line_down-1718000000")
-        - scenario_type / parameters / baseline_throughput: echo of
-            the inputs you simulated
-        - projected_throughput: integer units / period
-        - throughput_delta_pct: (projected - baseline) / baseline
-            * 100, rounded to 1 decimal; 0 when baseline is 0
-        - cost_delta_cents: signed (positive = more cost)
-        - schedule_fit_pct: 0..1 — what fraction of committed orders
-            still fit in window
-        - risk_flags: list of free-text risks
-        - run_at_utc: current UTC timestamp, ISO-8601
-
-      Scenario types:
-        add_shift, drop_shift, line_down, line_added,
-        demand_spike, demand_drop, labour_strike,
-        supplier_outage, feedstock_price_change
-
-      Recommendation policy — set "recommendation" by the FIRST
-      matching rule:
-        - proceed: scenario_type is add_shift or line_added AND
-            throughput_delta_pct > 0 AND schedule_fit_pct >= 0.85
-        - mitigate_required: scenario_type is line_down or
-            supplier_outage AND (schedule_fit_pct < 0.60 OR
-            throughput_delta_pct < -15)
-        - capacity_gap: scenario_type is demand_spike AND
-            schedule_fit_pct < 0.70
-        - review: any risk_flags present
-        - neutral: otherwise
-
-      Hard rule: "requires_planner_review" = true EXACTLY when
-      "recommendation" is mitigate_required, capacity_gap, or review;
-      false otherwise.
-
-      Don't extrapolate past 90 days — uncertainty too high.
-
-    enforce_yields: true
-
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "capacity_model_params"
-
+      # Approved a supplier review → re-plan now that the planner has OK'd it.
+      - agent: scheduler_agent
+        condition: "calling_agent_response.from_agent == 'supplier_signal_agent' and calling_agent_response.human_message == 'approved'"
+      # Approved a flagged schedule → the finisher (fail-closed re-check).
+      - agent: release_agent
+        condition: "calling_agent_response.from_agent == 'constraint_flagger_agent' and calling_agent_response.human_message == 'approved'"
+      # On silence/hold (default-deny) → record it; the Manager escalates.
+      - agent: planning_audit_logger_agent
+        condition: "calling_agent_response.human_message == 'held_for_review'"
     yields:
-      run_id: "string"
-      scenario_type: "string"
-      parameters: "object"
-      baseline_throughput: "number"
-      projected_throughput: "number"
-      throughput_delta_pct: "number"
-      cost_delta_cents: "number"
-      schedule_fit_pct: "number"
-      risk_flags: "list"
-      recommendation: "string"
-      requires_planner_review: "boolean"
-      run_at_utc: "string"
-
+      human_message: "string"       # approved | held_for_review
     inputs:
-      scenario_type: "string"
-      parameters: "object"
-      baseline_throughput: "number"
+      review: "object"
 
+  plant_manager_human:
+    name: plant_manager_human
+    agent_type: human
+    human_interface: webhook
+    communication_type: dual
+    human_timeout_seconds: 14400    # 4 hours — the safety/quality tier
+    description: "Plant manager — the safety/quality call on a safety-stock breach; approves or holds."
+    fallback_on_timeout: true
+    fallback_response:
+      human_decision: held
+      human_message: held_for_review
+    webhook_config:
+      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
+      outbound_headers: {Content-Type: "application/json"}
+      outbound_timeout: 30
     can_call:
-      - agent: "planner_human"
-        condition: "calling_agent_response.requires_planner_review == true"
+      - agent: release_agent
+        condition: "calling_agent_response.human_message == 'approved'"
+      - agent: planning_audit_logger_agent
+        condition: "calling_agent_response.human_message == 'held_for_review'"
+    yields:
+      human_message: "string"       # approved | held_for_review
+    inputs:
+      breach: "object"
 
-    auto_store_response: true
-    auto_store_yields: true
+  ops_director_human:
+    name: ops_director_human
+    agent_type: human
+    human_interface: webhook
+    communication_type: dual
+    human_timeout_seconds: 28800    # 8 hours — accountable owner, strategic escalation, final tier
+    description: "Operations director — accountable owner; reviews exceptions and unresolvable cases. Everything that leaves the pod."
+    fallback_on_timeout: true
+    fallback_response:
+      human_decision: held
+      human_message: held_for_review
+    webhook_config:
+      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
+      outbound_headers: {Content-Type: "application/json"}
+      outbound_timeout: 30
+    can_call:
+      - agent: release_agent
+        condition: "calling_agent_response.human_message == 'approved'"
+      - agent: planning_audit_logger_agent
+        condition: "calling_agent_response.human_message == 'held_for_review'"
+    yields:
+      human_message: "string"       # approved | held_for_review
+    inputs:
+      exception: "object"
 
+  # ─────────────────────────────────────────────────────────────────────────
+  # WORM audit sink — hash-chained, append-only, the terminus of every path.
+  # Registered in main.py via sdk.intelligence("planning_audit_logger_agent").
+  # ─────────────────────────────────────────────────────────────────────────
+  planning_audit_logger_agent:
+    name: planning_audit_logger_agent
+    agent_type: external
+    framework: custom
+    communication_type: execute
+    description: "WORM audit — hash-chains every release, approval, hold and intervention. Terminus."
+    connector_config:
+      sink_type: local_file
+      local_file_path: "./logs/planning_audit.jsonl"
+    can_call: []
