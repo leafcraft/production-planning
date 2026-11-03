@@ -20,7 +20,7 @@ hash-chained audit entry. Maya's day shrinks to the exceptions that matter.
 ```
  demand_signal ─┐
  capacity_change├─► plan_coordinator (Nova) ──open_case──► demand_sensor (Sensa)
- schedule_status┘                                          [instances:3, claim_line
+ schedule_status┘                                          [copies.count:3, claim_line
                                                             → 3 disjoint lines]
                                                                 │ picture_clean
                                                                 ▼
@@ -35,8 +35,8 @@ hash-chained audit entry. Maya's day shrinks to the exceptions that matter.
    └ routine → scheduler                             can_auto_release ──┼─► release_agent (Milo)
                                                                         │   [FINISHER, fail closed]
  planner_reply ─► planner_human (HITL resume)                          │        │
-   humans: approved → release_agent ; held_for_review → audit          │        ▼
-   (2h / 4h / 8h, default-deny on timeout → audit)                     └► planning_audit_logger
+   humans: approved → release_agent ; rejected/held → audit            │        ▼
+   (2h / 4h / 8h; silence closes the card, nothing released)           └► planning_audit_logger
                                                                           [hash-chained WORM, terminal]
 ```
 
@@ -45,7 +45,7 @@ hash-chained audit entry. Maya's day shrinks to the exceptions that matter.
 | Agent | Job title | Type |
 |---|---|---|
 | `plan_coordinator_agent` (Nova) | Plan Coordinator | llm (pure YAML) |
-| `demand_sensor_agent` (Sensa) | Demand & Capacity Sensor | llm + module (`instances`, `@chain`) |
+| `demand_sensor_agent` (Sensa) | Demand & Capacity Sensor | llm + module (`scaling.copies`, `@chain`) |
 | `scheduler_agent` (Rex) | Production Scheduler | llm + module (`super_agent`, `@chain`) |
 | `constraint_flagger_agent` (Gaia) | Auto-Release Gate | programmatic + module (3 floors) |
 | `release_agent` (Milo) | MES Release Finisher | programmatic + module (finisher) |
@@ -57,7 +57,7 @@ hash-chained audit entry. Maya's day shrinks to the exceptions that matter.
 
 ## 4. Modern capabilities used (fitted to the domain)
 
-- **instances (line fan-out)** — `demand_sensor_agent: instances: 3`.
+- **scaling.copies (line fan-out)** — `demand_sensor_agent: scaling.copies.count: 3`.
   Each copy calls the atomic `claim_line` tool to claim a DIFFERENT line,
   so N copies sense N disjoint lines with no duplicate work. The `@chain`
   floor re-averages `confidence` across copies (the `last` merge SUMs
@@ -79,7 +79,7 @@ hash-chained audit entry. Maya's day shrinks to the exceptions that matter.
 
 - **Deterministic auto-release gate** (Gaia) — Python, never an LLM; three
   floors (safety-stock/severity, material-availability BOM × on-hand,
-  capacity). Any breach forces a human.
+  capacity per line). Any breach forces a human.
 - **Fail-closed finisher** (Milo) — allow/deny token re-check (unknown →
   denied), invariant re-derivation (recoverable schedule, real orders, no
   double-release via an `actuated` marker), delete-on-block, dev-store
@@ -88,10 +88,13 @@ hash-chained audit entry. Maya's day shrinks to the exceptions that matter.
   (`_MAX_REOPT_ATTEMPTS = 1`) and routes to the Ops Director once spent.
 - **Supplier review floor** — Sable's `@chain` re-derives
   `requires_planner_review` (force-majeure / severity / single-source).
-- **HITL default-deny** — planner (2h) → plant manager (4h) → ops director
-  (8h); each `fallback_on_timeout: true` → `held_for_review` → the WORM
-  sink. No human→human wires (escalation is the Manager's job — avoids the
-  dual→dual footgun).
+- **Nothing released on silence** — planner (2h), plant manager (4h), ops
+  director (8h). An unanswered request closes its Inbox card and the ticket
+  records that no reply came; nobody is chased automatically. Each seat's
+  `fallback_response` (`held_for_review` → the WORM sink) is the declared
+  intent; leafmesh 2.4.486 does not route it for dual seats yet. Every answer
+  value (approved / rejected / held_for_review) has a route. No human→human
+  wires (avoids the dual→dual footgun).
 - **Hash-chained WORM** — `planning_audit_logger_agent` on every outcome.
 
 ## 6. Where data lives
@@ -103,7 +106,11 @@ hash-chained audit entry. Maya's day shrinks to the exceptions that matter.
   ships **no** system of record. `agency/_shared/store.py` is a seeded dev
   stand-in (demand, capacity, BOM/on-hand, suppliers, current schedule,
   line backlog) + the floor math (`material_shortfalls`,
-  `capacity_overrun`); the getter signatures are the connector contract.
+  `capacity_overruns`) + the MES push hook (`push_release`, returns nothing
+  day-0); the getter signatures are the connector contract. The seed
+  reconciles: per-line hours sum to the plant's 544h, the full 14-day plan
+  fits every floor, and the single-source microcontroller has 500 units of
+  headroom.
   Going live = swap the function bodies (Supabase / MCP), not the pod.
 
 ## 7. Verification
@@ -111,7 +118,7 @@ hash-chained audit entry. Maya's day shrinks to the exceptions that matter.
 - `python validate_config.py` → structure clean (10 agents, 6 entry points).
 - Load on SDK 2.4.131 → boots with **0 dual warnings**.
 - `pytest` → the deterministic floors, the finisher fail-closed logic, the
-  instances confidence re-average, and the bounded back-edge are unit-tested
+  copies confidence re-average, and the bounded back-edge are unit-tested
   with no LLM / Redis.
 - Day-0 dev-store run proves the chain; each connector is then verified at
   the **offered** layer and real cardinality before "live".
@@ -125,10 +132,10 @@ hash-chained audit entry. Maya's day shrinks to the exceptions that matter.
   ACTS — behind the human, re-checking authorization independently and
   failing closed. Splitting act-from-decide is the one-human/one-agent
   discipline held at the last stage.
-- **Why instances on the sensor, not the scheduler?** A daily line sweep is
+- **Why copies on the sensor, not the scheduler?** A daily line sweep is
   a backlog fan-out (claim → read disjoint lines); the scheduler's work is
   multi-step reasoning over the whole plant, which is what `super_agent`
-  is for. Stacking `instances × super_agent` would multiply cost for no gain.
+  is for. Stacking `copies × super_agent` would multiply cost for no gain.
 - **Why a dev store?** A dev *stub* is explicitly fine — it lets the full
   pod run day-0 and gives the deterministic floors real BOM/on-hand numbers
   to compute against. It is never a system of record; every read announces
