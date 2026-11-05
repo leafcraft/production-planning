@@ -1,10 +1,10 @@
 {
   "_entry_point": "supplier_signal",
-  "_description": "Silicon Ltd (single-source, no alternates) slips 5 days on chips — Sable's @chain floor FORCES a planner review, whatever the model rated it.",
+  "_description": "Kestrel Microdevices (single-source, no alternates) slips 5 days on microcontrollers — Sable's @chain floor FORCES a planner review, whatever the model rated it.",
   "supplier_signal": {
-    "supplier_id": "SUP-SILICON",
+    "supplier_id": "SUP-KESTREL",
     "signal_type": "delay",
     "delay_days": 5,
-    "affected_skus": ["GADGET-C", "GADGET-D"]
+    "affected_skus": ["CTL-310", "SNS-120"]
   }
 }

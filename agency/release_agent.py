@@ -15,9 +15,11 @@ closed":
      schedule_id, real sequenced orders, and NO double-release.
   c) render the real release pack to ./out; on a tripped floor, DELETE the
      partial and record status:blocked with reasons — never a half-release.
-  d) dev-store fallback that ANNOUNCES itself — with no MES connector wired
-     it records a verifiable dev outbox job (mes_job_id "DEV-…",
-     released:false, status:recorded_dev) and never fakes a real MES ack.
+  d) dev-store fallback that ANNOUNCES itself — until store.push_release()
+     returns a real MES acknowledgement it records a verifiable dev outbox
+     job (mes_job_id "DEV-…", released:false, status:recorded_dev) and says
+     why (no 'mes_mcp' vault record, or the record exists but the push is not
+     written yet). It never invents an MES job id.
   e) recovery across the HITL gate — the schedule is recovered from the
      session stash / dev store (the SDK resumes with only human meta).
 """
@@ -33,12 +35,14 @@ from leafmesh import LeafMeshLogger, chain
 try:
     from ._shared import store
     from ._shared.session_stash import resolve_session_id, stash_get, stash_put
+    from ._shared.wiring import vault_record_exists
 except ImportError:  # pragma: no cover
     import os
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _shared import store  # type: ignore
     from _shared.session_stash import resolve_session_id, stash_get, stash_put  # type: ignore
+    from _shared.wiring import vault_record_exists  # type: ignore
 
 logger = LeafMeshLogger(__name__)
 
@@ -142,7 +146,7 @@ def _delete_partial(result: dict) -> None:
         result["pack_path"] = ""
 
 
-def enforce_release_floor(result: Any, context: dict) -> dict:
+async def enforce_release_floor(result: Any, context: dict) -> dict:
     """The finisher floor — release ONLY on real authorization; delete on a block."""
     result = result if isinstance(result, dict) else {}
     result.setdefault("block_reasons", [])
@@ -188,16 +192,23 @@ def enforce_release_floor(result: Any, context: dict) -> dict:
     result["pack_path"] = _render_pack(schedule)
     now = datetime.now(timezone.utc).isoformat()
 
-    # (d) MES push — real connector, else a dev record that announces itself.
-    if store.mes_wired():
-        result["mes_job_id"] = f"mes-{uuid.uuid4().hex[:12]}"
+    # (d) MES push — the MES's own acknowledgement, else a dev record that
+    #     announces itself. The job id is never invented here.
+    ack = await store.push_release(schedule)
+    if isinstance(ack, dict) and ack.get("mes_job_id"):
+        result["mes_job_id"] = str(ack["mes_job_id"])
         result["released"] = True
         result["status"] = "released"
     else:
         result["mes_job_id"] = f"DEV-{uuid.uuid4().hex[:12]}"
-        result["released"] = False   # honest: no real MES ack day-0
+        result["released"] = False   # honest: no real MES ack
         result["status"] = "recorded_dev"
-        result["block_reasons"].append("no MES connector wired (MES_MCP_URL) — recorded to dev outbox, not pushed")
+        if await vault_record_exists("mes_mcp"):
+            why = ("vault record 'mes_mcp' exists but store.push_release() is not written yet "
+                   "— recorded to dev outbox, not pushed")
+        else:
+            why = "no MES connector (vault record 'mes_mcp') — recorded to dev outbox, not pushed"
+        result["block_reasons"].append(why)
 
     result["released_at_utc"] = now
     store.record_outbox({"schedule_id": schedule_id, "action": "release_to_mes",

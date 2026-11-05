@@ -1,10 +1,10 @@
 {
   "_entry_point": "supplier_signal",
-  "_description": "PolyChem slips 7 days on resin — has an alternate, so Sable absorbs it with an automatic re-plan (routine path).",
+  "_description": "Ridgeline Polymers slips 7 days on resin — has an alternate, so Sable absorbs it with an automatic re-plan (routine path).",
   "supplier_signal": {
-    "supplier_id": "SUP-POLYCHEM",
+    "supplier_id": "SUP-RIDGELINE",
     "signal_type": "delay",
     "delay_days": 7,
-    "affected_skus": ["WIDGET-B"]
+    "affected_skus": ["ENC-2208"]
   }
 }

@@ -9,9 +9,9 @@
 # WORM sink records every release and intervention.
 #
 # The pod is a TEAM, not a pipeline. Every wire is conditional; every
-# hand-off is a finished contract; every human gate default-denies on
-# silence; the finisher produces the real artifact and fails closed; the
-# WORM sink is the terminus. Systems (MES / ERP / MRP) are TOOLS inside
+# hand-off is a finished contract; nothing is released on silence; the
+# finisher produces the real artifact and fails closed; the WORM sink is the
+# terminus. Systems (MES / ERP / MRP) are TOOLS inside
 # agents, never members.
 #
 # Design doctrine: .claude/skills/leafmesh/building-agents-thoroughly.md
@@ -24,20 +24,17 @@ environment: development
 debug: true
 log_level: INFO
 
-persistence:
-  backend: redis
-  redis:
-    host: "${REDIS_HOST:localhost}"
-    port: ${REDIS_PORT:6379}
-    password: "${REDIS_PASSWORD:}"
-
 auto_discover:
   directory: ./agency
   pattern: '*_agent.py'
 
-# The Manager is the SUPERVISOR — it watches every hand-off and escalates
-# stalls / contract violations / repeated errors to the Ops Director. It is
-# not a router in the middle of the team.
+# The Manager is the SUPERVISOR, not a router in the middle of the team
+# (static routing). It escalates to the Ops Director on a non-retryable error
+# (auth / bad request / credit / bad config), when 5 different agents fail in
+# one case (max_errors_per_session), or when restarts run out. A malformed
+# hand-off only alerts. A question nobody answers is NOT escalated: the card
+# closes and the ticket records that no reply came. The re-sense loop and the
+# safety-stock route are can_call wires (Rex → Ops Director, Gaia → plant manager).
 manager:
   model: gpt-4o-mini
   domain: generic
@@ -46,33 +43,40 @@ manager:
     flows demand+capacity sensed line-by-line (Sensa) -> re-optimised
     (Rex) -> the deterministic auto-release gate (Gaia) -> a clean re-opt
     auto-releases to the MES (Milo, the finisher); a flagged one goes to a
-    planner. Escalate to the Ops Director when: a re-optimisation loops on
-    a cross-check discrepancy past its bound, a safety-stock floor would be
-    breached, an approval round times out, or any agent hands off a
-    malformed schedule. Silence never advances a release.
+    planner, a safety-stock breach to the plant manager, and an exhausted
+    re-sense loop to the Ops Director — those are the team's own wires. You
+    escalate to the Ops Director when agents keep failing. Silence never
+    advances a release.
   routing:
     mode: static
   escalation:
     targets:
       - type: human_agent
         agent: ops_director_human
+      # Webhook escalation (e.g. PagerDuty): create the vault connection
+      # 'escalation_webhook' (an "Add custom" record on the Infrastructure
+      # page, service type 'Outbound webhook'), then uncomment — here before the
+      # first start, in Studio's YAML editor after it (applies live, no restart).
       # - type: webhook
-      #   url: "${PAGER_WEBHOOK:}"
+      #   connection: escalation_webhook   # vault connection holds the URL + headers
+      # Slack escalation: posting needs a Slack adapter, which comes from a
+      # human seat's channels block. Connect Slack on Infrastructure →
+      # Messaging → Slack (vault record, e.g. 'slack_plant'), give
+      # ops_director_human `channels: {slack: {connection: slack_plant}}`, set
+      # SLACK_PLANT_CHANNEL in .env, then uncomment — here before the first
+      # start, in Studio's YAML editor after it.
       # - type: channel
       #   provider: slack
       #   channel_id: "${SLACK_PLANT_CHANNEL:}"
     auto_escalate:
       max_retries: 3
       max_errors_per_session: 5
-      timeout_threshold: 2
-
-mesh:
-  call_timeout: 150
 
 # 2.4.131 runtime block — the ONE non-default this pod genuinely needs:
 # Rex re-optimises as a super_agent (plan/execute/verify) and can run long.
 # Everything else stays default (omission is meaningful).
 timeouts:
+  mesh_call_default_timeout_s: 150
   llm_hard_timeout_s: 300
 
 # ── Entry points — one per real-world trigger ────────────────────────────────
@@ -149,9 +153,9 @@ agents:
   # line-by-line: claims a line, reads its demand and capacity, scores every
   # SKU's confidence, and REFUSES to guess. A SKU it cannot read with
   # confidence is flagged, never a made-up number in a schedule.
-  #   instances: 3  → three copies sweep the plant's lines in parallel;
+  #   copies.count: 3 → three copies sweep the plant's lines in parallel;
   #   claim_line    → each copy claims a DIFFERENT line (no duplicate work).
-  # @chain re-averages confidence across the copies (instances SUM numbers —
+  # @chain re-averages confidence across the copies (handoff: last SUMs numbers —
   # a footgun for a ratio) and enforces the confidence floor.
   # ─────────────────────────────────────────────────────────────────────────
   demand_sensor_agent:
@@ -163,8 +167,11 @@ agents:
     max_tool_calls_per_message: 12   # claim + read demand + read capacity per line; default 5 truncates silently
     description: "Demand & Capacity Sensor — claims a line, reads its demand + capacity, scores confidence, refuses to guess."
     # Line fan-out: 3 copies per activation, each claims a disjoint line.
-    instances: 3
-    instances_handoff: last          # COMBINE the copies and route once
+    scaling:                      # 2.4.484 (was instances / instances_handoff)
+      copies:
+        mode: fixed
+        count: 3
+        handoff: last          # COMBINE the copies and route once
     # Scheduled sweep — daily, in the plant's timezone (NOT UTC). Also
     # reachable via the daily_sweep entry point.
     wake_up: "0 6 * * *"
@@ -191,10 +198,18 @@ agents:
       picture_clean: "boolean"
       plant_id: "string"
       schedule_id: "string"
-      sku_demands: "array"
-      lines_read: "array"          # per-line {line_id, effective_capacity_hours, is_bottleneck}
-      low_confidence_skus: "array"
-      lines_claimed: "number"      # SUMS across instances — correct (count of lines this sweep claimed)
+      sku_demands:                 # one per SKU; units / due_date null when unreadable (the floor flags it)
+        type: array
+        items:
+          type: object
+          fields: {sku: string, units: {type: number, nullable: true}, due_date: {type: string, nullable: true}, confidence: number}
+      lines_read:                  # per-line {line_id, effective_capacity_hours, is_bottleneck}
+        type: array
+        items:
+          type: object
+          fields: {line_id: string, effective_capacity_hours: number, is_bottleneck: boolean}
+      low_confidence_skus: {type: array, items: string}
+      lines_claimed: "number"      # SUMS across copies — correct (count of lines this sweep claimed)
       confidence: "number"         # re-averaged in @chain (SUM would be wrong for a ratio)
       notes: "string"
     # Playbook — the CRAFT, fetched on demand. Only `description` rides in the
@@ -220,20 +235,20 @@ agents:
     # has no real source. See agency/tools.py.
     tools: [claim_line, read_line_demand, read_line_capacity, list_prior_schedules]
     tool_categories: [planning]
-    # ── To wire real MES/ERP, uncomment and set the URLs (each named action
-    #    under `use:` becomes its own tool). NOTE: the SDK rejects an http mcp
-    #    block with an EMPTY url at load, so this ships commented — fill the
-    #    URL, then uncomment. ──
+    # ── To wire real MES/ERP: create the vault connections 'mes_mcp' and
+    #    'erp_mrp_mcp' on Infrastructure → Integrations → MCP (each an MCP server's
+    #    connection: its address + token), then uncomment — here before the first
+    #    start, in Studio's YAML editor after it (applies live, no restart). Each
+    #    named action under `use:` becomes its own tool. The address and token live only in
+    #    the vault — never write url:/token: here. ──
     # mcp:
-    #   - transport: http
-    #     url: "${MES_MCP_URL}"
-    #     token: "${MES_MCP_TOKEN:}"
+    #   - connection: mes_mcp
+    #     transport: http
     #     use: [get_line_capacity, get_maintenance_windows]
     #     name: mes
     #     timeout: 30
-    #   - transport: http
-    #     url: "${ERP_MRP_MCP_URL}"
-    #     token: "${ERP_MRP_MCP_TOKEN:}"
+    #   - connection: erp_mrp_mcp
+    #     transport: http
     #     use: [get_line_demand, run_mrp_explosion]
     #     name: erp
     #     timeout: 30
@@ -282,9 +297,17 @@ agents:
       cross_check_ok: "boolean"
       discrepancy: "string"
       reopt_retry_exhausted: "boolean"   # loop guard for the back-edge to Sensa
-      sequenced_orders: "array"
+      sequenced_orders:                  # the floor cross-checks sku / units / line_id
+        type: array
+        items:
+          type: object
+          fields: {sku: string, units: number, line_id: string, shift_id: string}
       on_time_delivery_pct: "number"
-      unmet_demand: "array"
+      unmet_demand:                      # the gate reads reason (safety_stock / shortage / supplier)
+        type: array
+        items:
+          type: object
+          fields: {sku: string, units_short: number, reason: string}
       schedule_id: "string"
       confidence: "number"
       planner_briefing: "string"
@@ -405,10 +428,10 @@ agents:
     yields:
       supplier_id: "string"
       signal_type: "string"      # delay | quality | capacity_cut | force_majeure | early_delivery
-      affected_skus: "array"
+      affected_skus: {type: array, items: string}
       delay_days: "number"
       propagation_summary: "string"
-      alternate_supplier_options: "array"
+      alternate_supplier_options: {type: array, items: {type: object, fields: {supplier_id: string}}}
       severity: "number"
       requires_planner_review: "boolean"
     playbook:
@@ -430,15 +453,23 @@ agents:
         condition: "calling_agent_response.requires_planner_review == false"
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Human members — first-class, reached in the channel they already live in.
-  # Every gate DEFAULT-DENIES on timeout (fallback -> held_for_review -> audit).
-  # `dual` belongs on the human/boundary agents ONLY; AI specialists are chain.
+  # Human members — first-class, answered in Studio's Inbox. Timeouts follow
+  # the plant's working day: the planner answers a flagged schedule inside
+  # 2h of the same shift; the plant manager makes a safety-stock call within
+  # 4h; the ops director answers within a business day (8h).
+  # If nobody answers in time, the request waits no longer: its Inbox card
+  # closes and the ticket records that no reply came. Nothing is released on
+  # silence, and nobody is chased automatically. fallback_on_timeout /
+  # fallback_response state the intended default-deny (held_for_review ->
+  # audit); leafmesh 2.4.486 does not route it for these dual seats yet.
+  # Every value a seat asks for (approved / rejected / held_for_review) has
+  # a route. `dual` belongs on the human/boundary agents ONLY.
   # ─────────────────────────────────────────────────────────────────────────
 
   planner_human:
     name: planner_human
     agent_type: human
-    human_interface: webhook
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: dual
     human_timeout_seconds: 7200     # 2 hours to decide a flagged schedule / supplier review
     description: "Production planner — decides flagged schedules and supplier reviews; approves release."
@@ -446,12 +477,6 @@ agents:
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
-      max_retries: 1
-      retry_delay: 2
     can_call:
       # Approved a supplier review → re-plan now that the planner has OK'd it.
       - agent: scheduler_agent
@@ -459,18 +484,18 @@ agents:
       # Approved a flagged schedule → the finisher (fail-closed re-check).
       - agent: release_agent
         condition: "calling_agent_response.from_agent == 'constraint_flagger_agent' and calling_agent_response.human_message == 'approved'"
-      # On silence/hold (default-deny) → record it; the Manager escalates.
+      # Rejected or held → record it. Nothing is released.
       - agent: planning_audit_logger_agent
-        condition: "calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message == 'rejected' or calling_agent_response.human_message == 'held_for_review'"
     yields:
-      human_message: "string"       # approved | held_for_review
+      human_message: "string"       # approved | rejected | held_for_review
     inputs:
       review: "object"
 
   plant_manager_human:
     name: plant_manager_human
     agent_type: human
-    human_interface: webhook
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: dual
     human_timeout_seconds: 14400    # 4 hours — the safety/quality tier
     description: "Plant manager — the safety/quality call on a safety-stock breach; approves or holds."
@@ -478,24 +503,20 @@ agents:
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
     can_call:
       - agent: release_agent
         condition: "calling_agent_response.human_message == 'approved'"
       - agent: planning_audit_logger_agent
-        condition: "calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message == 'rejected' or calling_agent_response.human_message == 'held_for_review'"
     yields:
-      human_message: "string"       # approved | held_for_review
+      human_message: "string"       # approved | rejected | held_for_review
     inputs:
       breach: "object"
 
   ops_director_human:
     name: ops_director_human
     agent_type: human
-    human_interface: webhook
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: dual
     human_timeout_seconds: 28800    # 8 hours — accountable owner, strategic escalation, final tier
     description: "Operations director — accountable owner; reviews exceptions and unresolvable cases. Everything that leaves the pod."
@@ -503,17 +524,13 @@ agents:
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
     can_call:
       - agent: release_agent
         condition: "calling_agent_response.human_message == 'approved'"
       - agent: planning_audit_logger_agent
-        condition: "calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message == 'rejected' or calling_agent_response.human_message == 'held_for_review'"
     yields:
-      human_message: "string"       # approved | held_for_review
+      human_message: "string"       # approved | rejected | held_for_review
     inputs:
       exception: "object"
 
@@ -525,7 +542,7 @@ agents:
     name: planning_audit_logger_agent
     agent_type: external
     framework: custom
-    communication_type: execute
+    communication_type: chain
     description: "WORM audit — hash-chains every release, approval, hold and intervention. Terminus."
     connector_config:
       sink_type: local_file
