@@ -14,10 +14,11 @@ signatures are the contract you swap real systems into** — the pod does
 not change. Every read that has no seed **announces itself**
 (`available: false` + a reason), never a confident empty result.
 
-To go live: swap each read below for the matching MCP connector (see the
-commented `mcp:` block in configs/config.yaml) and point `.env` at
-`MES_MCP_URL` / `ERP_MRP_MCP_URL`. Setting the env vars alone does
-nothing until the reads here are wired.
+To go live: create the vault records 'mes_mcp' / 'erp_mrp_mcp' (Studio →
+Infrastructure → Integrations → MCP), uncomment the `mcp:` block in
+the configuration, and swap each read below for the matching connector
+call. Creating the records alone does nothing here until the reads (and
+push_release) are wired.
 
 Single-process JSON under ./data (survives the HITL wait — the mesh is
 one process). Swap for the Redis/Postgres session store at multi-replica
@@ -67,72 +68,89 @@ def _save(k: str, d: Any) -> None:
 
 
 # ── Seed data — a realistic Portland plant snapshot ──────────────────
-# Three lines, two shifts. Demand slightly over effective capacity so a
-# clean re-opt is possible but a supplier slip / safety-stock breach is
-# what actually forces the planner — the interesting paths all reachable.
+# An industrial-controls plant: steel enclosures, controller boards, sensors
+# and mounting brackets. Three lines, 14-day window. Every number reconciles:
+#   * capacity — gross = shifts × 8h × 14 days per line (LINE-1 224h, LINE-2
+#     224h, LINE-3 112h = 560h); LINE-2 loses one 16h planned-maintenance
+#     window → effective 544h. read_line_capacity() computes the same.
+#   * load — units ÷ the line's units/hour: LINE-1 13,300 u ÷ 70 = 190.0h of
+#     224h (85%); LINE-2 10,200 u ÷ 55 = 185.5h of 208h (89%, the bottleneck);
+#     LINE-3 3,600 u ÷ 40 = 90.0h of 112h (80%). The full plan fits.
+#   * material — demand × BOM vs on-hand minus safety stock: steel 31,900 kg
+#     of 33,000; resin 25,000 kg of 26,500; MCUs 10,200 of 10,700. The full
+#     plan clears every floor (the happy path auto-releases), with only 500
+#     MCUs of headroom — so a slip at the single-source MCU supplier, or a
+#     demand spike on CTL-310, is what forces a human.
 _SEED_DEMAND = {
     "plant_id": PLANT,
     "planning_window_days": 14,
     "captured_at_utc": None,                       # stamped on first read
     "sku_demands": [
-        {"sku": "WIDGET-A", "units": 4200, "due_date": _days(7),  "customer_segment": "retail",      "tier": "top20"},
-        {"sku": "WIDGET-B", "units": 3100, "due_date": _days(10), "customer_segment": "wholesale",   "tier": "standard"},
-        {"sku": "GADGET-C", "units": 2600, "due_date": _days(5),  "customer_segment": "retail",      "tier": "top20"},
-        {"sku": "GADGET-D", "units": 1500, "due_date": _days(12), "customer_segment": "distributor", "tier": "standard"},
-        {"sku": "BRACKET-E", "units": 1000, "due_date": _days(9), "customer_segment": "oem",         "tier": "standard"},
+        {"sku": "ENC-4410", "units": 7800, "due_date": _days(7),  "customer_segment": "oem",         "tier": "top20"},
+        {"sku": "ENC-2208", "units": 5500, "due_date": _days(10), "customer_segment": "distributor", "tier": "standard"},
+        {"sku": "CTL-310",  "units": 6200, "due_date": _days(5),  "customer_segment": "oem",         "tier": "top20"},
+        {"sku": "SNS-120",  "units": 4000, "due_date": _days(12), "customer_segment": "distributor", "tier": "standard"},
+        {"sku": "BRK-0750", "units": 3600, "due_date": _days(9),  "customer_segment": "aftermarket", "tier": "standard"},
     ],
     "notable_shifts": [
-        "WIDGET-A forecast +18% vs prior period (retail promo)",
-        "GADGET-C pulled in 2 days (expedite request)",
+        "ENC-4410 forecast +18% vs prior period (OEM program ramp)",
+        "CTL-310 pulled in 2 days (expedite request from a top-20 account)",
     ],
 }
 
 _SEED_CAPACITY = {
     "plant_id": PLANT,
-    "total_capacity_hours": 1008.0,                # 3 lines × 2 shifts × 8h × 14 days / norm
-    "effective_capacity_hours": 882.0,             # net of maintenance + changeover
+    "total_capacity_hours": 560.0,                 # (2 + 2 + 1 shifts) × 8h × 14 days
+    "effective_capacity_hours": 544.0,             # net of LINE-2's 16h maintenance window
     "bottleneck_lines": ["LINE-2"],
     "planned_maintenance_windows": [
         {"line_id": "LINE-2", "start_utc": _days(3), "end_utc": _days(4), "reason": "preventive"},
     ],
     "lines": [
-        {"line_id": "LINE-1", "shifts": ["DAY", "SWING"], "units_per_hour": 70, "skus": ["WIDGET-A", "WIDGET-B"]},
-        {"line_id": "LINE-2", "shifts": ["DAY", "SWING"], "units_per_hour": 55, "skus": ["GADGET-C", "GADGET-D"]},
-        {"line_id": "LINE-3", "shifts": ["DAY"],          "units_per_hour": 40, "skus": ["BRACKET-E"]},
+        {"line_id": "LINE-1", "shifts": ["DAY", "SWING"], "units_per_hour": 70, "skus": ["ENC-4410", "ENC-2208"]},
+        {"line_id": "LINE-2", "shifts": ["DAY", "SWING"], "units_per_hour": 55, "skus": ["CTL-310", "SNS-120"]},
+        {"line_id": "LINE-3", "shifts": ["DAY"],          "units_per_hour": 40, "skus": ["BRK-0750"]},
     ],
 }
 
 # BOM: finished SKU → components (material, qty per finished unit).
+# Steel and resin in kg, microcontrollers (MCU) each.
 _SEED_BOM = {
-    "WIDGET-A":  [{"material": "MAT-STEEL", "qty_per_unit": 2}, {"material": "MAT-POLY", "qty_per_unit": 1}],
-    "WIDGET-B":  [{"material": "MAT-STEEL", "qty_per_unit": 1}, {"material": "MAT-POLY", "qty_per_unit": 2}],
-    "GADGET-C":  [{"material": "MAT-CHIP",  "qty_per_unit": 1}, {"material": "MAT-POLY", "qty_per_unit": 1}],
-    "GADGET-D":  [{"material": "MAT-CHIP",  "qty_per_unit": 1}],
-    "BRACKET-E": [{"material": "MAT-STEEL", "qty_per_unit": 3}],
+    "ENC-4410": [{"material": "MAT-CRS-16GA", "qty_per_unit": 2}, {"material": "MAT-PC-RESIN", "qty_per_unit": 1}],
+    "ENC-2208": [{"material": "MAT-CRS-16GA", "qty_per_unit": 1}, {"material": "MAT-PC-RESIN", "qty_per_unit": 2}],
+    "CTL-310":  [{"material": "MAT-MCU-32",   "qty_per_unit": 1}, {"material": "MAT-PC-RESIN", "qty_per_unit": 1}],
+    "SNS-120":  [{"material": "MAT-MCU-32",   "qty_per_unit": 1}],
+    "BRK-0750": [{"material": "MAT-CRS-16GA", "qty_per_unit": 3}],
 }
 
 # On-hand inventory + safety stock floor per material.
 _SEED_MATERIALS = {
-    "MAT-STEEL": {"on_hand": 14000, "safety_stock": 2000, "supplier_id": "SUP-NW-METALS", "lead_time_days": 7},
-    "MAT-POLY":  {"on_hand": 9000,  "safety_stock": 1500, "supplier_id": "SUP-POLYCHEM",  "lead_time_days": 10},
-    "MAT-CHIP":  {"on_hand": 3000,  "safety_stock": 800,  "supplier_id": "SUP-SILICON",   "lead_time_days": 21},
+    "MAT-CRS-16GA": {"description": "Cold-rolled steel sheet, 16 ga (kg)", "on_hand": 36000, "safety_stock": 3000,
+                     "supplier_id": "SUP-NWCOIL", "lead_time_days": 7},
+    "MAT-PC-RESIN": {"description": "Polycarbonate resin (kg)", "on_hand": 29000, "safety_stock": 2500,
+                     "supplier_id": "SUP-RIDGELINE", "lead_time_days": 10},
+    "MAT-MCU-32":   {"description": "32-bit microcontroller (each)", "on_hand": 11900, "safety_stock": 1200,
+                     "supplier_id": "SUP-KESTREL", "lead_time_days": 21},
 }
 
 _SEED_SUPPLIERS = {
-    "SUP-NW-METALS": {"name": "NW Metals",  "reliability": 0.96, "alternates": ["SUP-CASCADE-STEEL"]},
-    "SUP-POLYCHEM":  {"name": "PolyChem",   "reliability": 0.91, "alternates": ["SUP-RESINCO"]},
-    "SUP-SILICON":   {"name": "Silicon Ltd","reliability": 0.84, "alternates": []},   # single-source — slips force a human
+    "SUP-NWCOIL":    {"name": "Northwest Coil & Bar",  "reliability": 0.96, "alternates": ["SUP-HARBOR-STEEL"]},
+    "SUP-RIDGELINE": {"name": "Ridgeline Polymers",    "reliability": 0.91, "alternates": ["SUP-BLUEFIR"]},
+    "SUP-KESTREL":   {"name": "Kestrel Microdevices",  "reliability": 0.84, "alternates": []},   # single-source — slips force a human
 }
 
-# The schedule currently on the floor (what a re-opt revises).
+# The schedule currently on the floor (what a re-opt revises). Run times tie
+# to the line rates over two 8h shifts a day: CTL-310 6,200 ÷ 55 = 112.7h ≈ 7
+# days; ENC-4410 7,800 ÷ 70 = 111.4h ≈ 7 days, then ENC-2208 5,500 ÷ 70 =
+# 78.6h ≈ 5 days on the same line.
 _SEED_SCHEDULE = {
-    "schedule_id": "sch-current-0001",
+    "schedule_id": "sch-pdx-2026-w44",
     "released_at_utc": _days(-1),
     "on_time_delivery_pct": 0.94,
     "sequenced_orders": [
-        {"sku": "GADGET-C", "units": 2600, "line_id": "LINE-2", "shift_id": "DAY",   "start_utc": _days(0), "end_utc": _days(2)},
-        {"sku": "WIDGET-A", "units": 4200, "line_id": "LINE-1", "shift_id": "DAY",   "start_utc": _days(0), "end_utc": _days(4)},
-        {"sku": "WIDGET-B", "units": 3100, "line_id": "LINE-1", "shift_id": "SWING", "start_utc": _days(4), "end_utc": _days(8)},
+        {"sku": "CTL-310",  "units": 6200, "line_id": "LINE-2", "shift_id": "DAY+SWING", "start_utc": _days(0), "end_utc": _days(7)},
+        {"sku": "ENC-4410", "units": 7800, "line_id": "LINE-1", "shift_id": "DAY+SWING", "start_utc": _days(0), "end_utc": _days(7)},
+        {"sku": "ENC-2208", "units": 5500, "line_id": "LINE-1", "shift_id": "DAY+SWING", "start_utc": _days(7), "end_utc": _days(12)},
     ],
 }
 
@@ -180,10 +198,10 @@ def current_schedule(plant_id: str = PLANT) -> dict[str, Any]:
     return _seeded("schedule", _SEED_SCHEDULE)
 
 
-# ── Per-line reads + atomic line claim (instances line fan-out) ──────
-# demand_sensor_agent runs `instances: N` copies; each copy CLAIMS one
+# ── Per-line reads + atomic line claim (scaling.copies line fan-out) ──────
+# demand_sensor_agent runs `scaling.copies.count: N` copies; each copy CLAIMS one
 # line atomically so the copies read DISJOINT lines instead of all
-# reading the same thing (see nuances "Parallel instances").
+# reading the same thing (see the leafmesh skill's nuances on parallel copies).
 _CLAIM_LOCK = threading.Lock()
 _CLAIM_STATE: dict[str, list[str]] = {}
 
@@ -297,19 +315,38 @@ def material_shortfalls(sku_demands: list[dict[str, Any]]) -> list[dict[str, Any
     return out
 
 
-def capacity_overrun(scheduled_hours: float, plant_id: str = PLANT) -> dict[str, Any]:
-    """Compare a schedule's load against effective capacity. The capacity
-    floor: a schedule the floor physically cannot run is not auto-releasable.
+def capacity_overruns(scheduled: list[dict[str, Any]], plant_id: str = PLANT) -> list[dict[str, Any]]:
+    """The capacity floor, per line: load (units ÷ the line's units/hour)
+    against the line's effective hours over the window. A line the floor
+    cannot physically run is not auto-releasable. An order for a SKU no line
+    makes is reported too (it cannot be run anywhere).
+
+    Returns [{line_id, scheduled_hours, effective_capacity_hours,
+              overrun_hours}] for each overloaded line, plus
+            [{line_id: "", sku, reason: "no line makes this SKU"}].
     """
     cap = line_capacity(plant_id)
-    eff = float(cap.get("effective_capacity_hours") or 0)
-    over = max(0.0, float(scheduled_hours or 0) - eff)
-    return {
-        "scheduled_hours": round(float(scheduled_hours or 0), 2),
-        "effective_capacity_hours": eff,
-        "overrun_hours": round(over, 2),
-        "exceeds_capacity": over > 0,
-    }
+    lines = {l["line_id"]: l for l in cap.get("lines", [])}
+    sku_line = {sku: l["line_id"] for l in cap.get("lines", []) for sku in l.get("skus", [])}
+    load: dict[str, float] = {}
+    out: list[dict[str, Any]] = []
+    for o in scheduled or []:
+        if not isinstance(o, dict):
+            continue
+        sku = str(o.get("sku") or "")
+        lid = str(o.get("line_id") or "") or sku_line.get(sku, "")
+        line = lines.get(lid)
+        if not line or not line.get("units_per_hour"):
+            out.append({"line_id": "", "sku": sku, "reason": "no line makes this SKU"})
+            continue
+        load[lid] = load.get(lid, 0.0) + float(o.get("units") or 0) / float(line["units_per_hour"])
+    for lid, hours in sorted(load.items()):
+        eff = float(read_line_capacity(plant_id, lid).get("effective_capacity_hours") or 0)
+        if hours > eff:
+            out.append({"line_id": lid, "scheduled_hours": round(hours, 1),
+                        "effective_capacity_hours": eff,
+                        "overrun_hours": round(hours - eff, 1)})
+    return out
 
 
 # ── The pod's own outbox + append-only ledger + finisher recovery ────
@@ -350,7 +387,12 @@ def get_approved_schedule(schedule_id: str) -> dict[str, Any]:
     return (_load("approved_schedules") or {}).get(schedule_id, {})
 
 
-def mes_wired() -> bool:
-    """True if a real MES release connector is configured."""
-    import os
-    return bool(os.getenv("MES_MCP_URL"))
+async def push_release(schedule: dict[str, Any]) -> dict[str, Any] | None:
+    """Push an approved schedule to the MES and return its acknowledgement
+    ({"mes_job_id": ...}), or None when no push is wired.
+
+    Day 0 there is no push: this returns None and the finisher records a dev
+    outbox job that says so. To go live, create the vault record 'mes_mcp'
+    and replace this body with the MES release call; return the MES's own
+    job id. Never invent an id here."""
+    return None

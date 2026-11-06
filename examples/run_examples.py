@@ -66,7 +66,9 @@ async def main() -> int:
         print("No scenarios matched.")
         return 1
 
-    sdk = LeafMesh.from_yaml("configs/config.yaml")
+    from dotenv import load_dotenv
+    load_dotenv()
+    sdk = LeafMesh.from_store()
     _audit_logger.register(sdk, "planning_audit_logger_agent")
     await sdk.start()
     try:
