@@ -1,6 +1,6 @@
 {
   "_entry_point": "capacity_change",
-  "_description": "LINE-2 (the bottleneck) drops for unplanned maintenance — Nova opens a case and the pod re-plans against the reduced ceiling.",
+  "_description": "LINE-2 (the bottleneck) drops for unplanned maintenance — Nova opens a case and the pod re-plans. Day 0 the seeded MES calendar holds only LINE-2's planned 16h window; add the outage to the seed (or wire the MES) to see the reduced ceiling.",
   "plant_id": "PLANT-PDX",
   "message": "LINE-2 down for unplanned maintenance — re-plan against the reduced capacity.",
   "signal_source": "capacity"

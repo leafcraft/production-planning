@@ -13,8 +13,9 @@ scheduler's output and the plant's real material/capacity picture:
        minus safety stock; any material that would breach its safety-stock
        floor is a safety_stock_breach. The plant cannot run a schedule it
        has no material for.
-  3. CAPACITY — a schedule whose load exceeds effective capacity physically
-       cannot run → high-severity conflict.
+  3. CAPACITY — per line: units ÷ the line's units/hour against that line's
+       effective hours over the window. An overloaded line (or a SKU no line
+       makes) physically cannot run → high-severity conflict.
 
 AUTO-RELEASE only when no floor fires AND every conflict is below severity
 0.5. It also merges the verdict into the per-session stash so the finisher
@@ -37,11 +38,6 @@ except ImportError:  # pragma: no cover
     from _shared.session_stash import resolve_session_id, stash_get, stash_put  # type: ignore
 
 logger = LeafMeshLogger(__name__)
-
-# Effective hours per unit — line-agnostic dev approximation to turn a unit
-# load into hours for the capacity floor. PROD: per-line units_per_hour.
-_HOURS_PER_UNIT = 1.0 / 55.0   # ~ slowest line's rate; conservative
-
 
 def _up(input_data: dict[str, Any], key: str, default: Any = None) -> Any:
     """Upstream read: flat input_data, then upstream_yields (flat or keyed
@@ -66,7 +62,8 @@ def _scheduled_skus(input_data: dict[str, Any], stashed: dict[str, Any]) -> list
     out: list[dict[str, Any]] = []
     for o in orders or []:
         if isinstance(o, dict) and o.get("sku"):
-            out.append({"sku": str(o["sku"]), "units": float(o.get("units") or 0)})
+            out.append({"sku": str(o["sku"]), "units": float(o.get("units") or 0),
+                        "line_id": str(o.get("line_id") or "")})
     return out
 
 
@@ -107,17 +104,14 @@ def compute_gate(input_data: dict[str, Any], stashed: dict[str, Any] | None = No
                        f"(would breach safety stock; supplier {sf.get('supplier_id', '?')})",
         })
 
-    # ── Floor 3: capacity (load vs effective capacity) ──
-    scheduled_units = sum(s["units"] for s in scheduled)
-    scheduled_hours = scheduled_units * _HOURS_PER_UNIT
-    overrun = store.capacity_overrun(scheduled_hours) if scheduled_units else {"exceeds_capacity": False, "overrun_hours": 0}
-    if overrun.get("exceeds_capacity"):
-        conflicts.append({
-            "type": "capacity_overrun", "severity": 0.8,
-            "summary": f"schedule load {overrun.get('scheduled_hours')}h exceeds "
-                       f"effective capacity {overrun.get('effective_capacity_hours')}h "
-                       f"by {overrun.get('overrun_hours')}h",
-        })
+    # ── Floor 3: capacity, per line (load vs that line's effective hours) ──
+    for ov in store.capacity_overruns(scheduled):
+        if not ov.get("line_id"):
+            summary = f"{ov.get('sku', '?')}: {ov.get('reason')}"
+        else:
+            summary = (f"{ov['line_id']}: load {ov['scheduled_hours']}h exceeds effective "
+                       f"capacity {ov['effective_capacity_hours']}h by {ov['overrun_hours']}h")
+        conflicts.append({"type": "capacity_overrun", "severity": 0.8, "summary": summary})
 
     # ── Verdict — floors the LLM can't waive ──
     requires_planner = bool(safety_breach) or any(c["severity"] >= 0.7 for c in conflicts)
