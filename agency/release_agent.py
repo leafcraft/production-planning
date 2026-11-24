@@ -1,6 +1,6 @@
 """Milo — MES Release Finisher (the FINISHER / actuator).
 
-auto_discover matches `release_agent`. Milo sits BEHIND the gate + the
+auto_discover matches `release_agent`. Milo sits BEHIND the decision + the
 human approval. It never approves — it is the concrete "@chain fails
 closed":
 
@@ -20,7 +20,7 @@ closed":
      job (mes_job_id "DEV-…", released:false, status:recorded_dev) and says
      why (no 'mes_mcp' vault record, or the record exists but the push is not
      written yet). It never invents an MES job id.
-  e) recovery across the HITL gate — the schedule is recovered from the
+  e) recovery across the human step — the schedule is recovered from the
      session stash / dev store (the SDK resumes with only human meta).
 """
 from __future__ import annotations
@@ -68,7 +68,7 @@ def _sources(input_data: dict) -> list[dict]:
 def _signal(input_data: dict) -> str:
     """The human verdict, from wherever the SDK delivered it (shape-tolerant)."""
     for src in _sources(input_data):
-        for key in ("human_message", "human_decision", "decision", "message"):
+        for key in ("verdict", "human_message", "human_decision", "decision", "message"):
             val = src.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip().lower()

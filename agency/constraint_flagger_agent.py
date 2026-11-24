@@ -19,7 +19,7 @@ scheduler's output and the plant's real material/capacity picture:
 
 AUTO-RELEASE only when no floor fires AND every conflict is below severity
 0.5. It also merges the verdict into the per-session stash so the finisher
-recovers the schedule after the human gate.
+recovers the schedule after the human step.
 """
 from __future__ import annotations
 
@@ -135,7 +135,7 @@ async def constraint_flagger_agent(llm_response: Any, input_data: Any, context: 
     schedule_id = str(_up(input_data, "schedule_id", "") or stashed.get("schedule_id") or "")
 
     # Merge the verdict into the stash so the finisher recovers the full
-    # schedule + the gate decision after the human gate.
+    # schedule + the gate decision after the human step.
     if schedule_id:
         stashed["schedule_id"] = schedule_id
     stashed.update({

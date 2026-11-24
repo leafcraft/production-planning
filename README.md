@@ -56,7 +56,7 @@ microcontroller in the CTL-310 controller, slips five days. **Sable**
 (Supplier-Risk Analyst) ingests the notice; because it's a single-source
 vendor its `@chain` floor forces a planner review no matter how the model
 rated it. Maya sees one decision. If she does not answer within two hours,
-her Inbox card closes and the ticket records that no reply came — nothing is
+the seat's default reply, `hold`, is recorded in the audit log — nothing is
 released on silence, and nobody is chased automatically.
 
 ## 2. Why it works in an organization
@@ -83,7 +83,7 @@ delivery or breach a safety-stock floor.
 ### Tier 1 — Boot (required to start at all)
 | Var | Why |
 |---|---|
-| `LEAFMESH_LICENSE_KEY` | required by the SDK at `start()` |
+| `LEAFMESH_LICENSE_KEY` | Not kept in `.env`: `create-leafmesh --start` (or `--load`) asks for it once at the first start to sign this environment in (leafmesh 2.4.538+) |
 | `OPENAI_API_KEY` | Nova, Sensa, Sable (gpt-4o-mini) + the Manager |
 | `ANTHROPIC_API_KEY` | Rex (claude-sonnet-4-6, the Super-Agent scheduler) |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | session + persistence (defaults `localhost:6379`, no password) |
@@ -118,22 +118,22 @@ not change.
 ### Tier 3 — HITL + escalation egress (optional)
 | Var | Used by | Note |
 |---|---|---|
-| *(no setting)* | the three human gates | answer in Studio's Inbox; to notify an external tool instead, create a vault connection (an "Add custom" record on the Infrastructure page, service type 'Outbound webhook') and set `webhook_config: {connection: <name>}` on the seat |
+| *(no setting)* | the three human members | answer in Studio's Inbox; to notify an external tool instead, create a vault connection (an "Add custom" record on the Infrastructure page, service type 'Outbound webhook') and set `webhook_config: {connection: <name>}` on the seat |
 | *(vault connection `escalation_webhook`)* / `SLACK_PLANT_CHANNEL` | Manager escalation (commented targets) | webhook: create the vault connection (the target already picks `connection: escalation_webhook`); Slack: connect Slack on Infrastructure → Messaging → Slack (vault record, e.g. `slack_plant`), give `ops_director_human` `channels: {slack: {connection: slack_plant}}`, set the var (the target cannot post without that adapter); then uncomment the target in `manager.escalation` (in Studio's raw YAML editor) |
 
 ## 4. Agents
 
 | Agent | Human job title / role | Responsibilities | Type & wiring |
 |---|---|---|---|
-| `plan_coordinator_agent` (**Nova**) | Plan Coordinator | Opens each change case, orchestrates, keeps live status, single point of contact. Never senses, schedules, or approves. | llm (gpt-4o-mini), pure YAML, chain → `demand_sensor` (open) \| `ops_director_human` (escalate) |
+| `plan_coordinator_agent` (**Nova**) | Plan Coordinator | Opens each change case, orchestrates, keeps live status, single point of contact. Never senses, schedules, or approves. | llm (gpt-4o-mini), pure YAML, playbook `open_case`/`status`/`escalate`, chain → `demand_sensor` (open) \| `ops_director_human` (escalate) |
 | `demand_sensor_agent` (**Sensa**) | Demand & Capacity Sensor | Claims a line, reads its demand + capacity, scores confidence, refuses to guess. `scaling.copies.count: 3` fan-out; `@chain` re-averages confidence + confidence floor. | llm (gpt-4o-mini), `agency/demand_sensor_agent.py`, tools `claim_line`/`read_line_*`, playbook `sensing`, wake_up `0 6 * * *` (America/Los_Angeles) → `scheduler` (clean) \| `ops_director_human` (unclean) |
 | `scheduler_agent` (**Rex**) | Production Scheduler | Re-optimises across lines/shifts, cross-checks, briefs the planner, renders a draft. `super_agent` (plan/execute/verify); `@chain` cross-check floor + bounded re-sense back-edge + pre-gate stash. | llm (claude-sonnet-4-6), `agency/scheduler_agent.py`, playbook `reoptimize` → `demand_sensor` (bounded retry) \| `ops_director_human` (exhausted) \| `constraint_flagger` (clean) |
 | `constraint_flagger_agent` (**Gaia**) | Auto-Release Gate | THREE deterministic floors (safety-stock/severity, material-availability, capacity) decide auto-release vs a human. Reproducible math, never an LLM. | programmatic, `agency/constraint_flagger_agent.py` → `plant_manager_human` (safety breach) \| `planner_human` (review) \| `release_agent` (clean) |
 | `release_agent` (**Milo**) | MES Release Finisher | Re-checks authorization (fail closed on unknown), re-derives invariants, renders the release pack, deletes on block, ledgers; dev-store fallback announces itself. | programmatic FINISHER, `agency/release_agent.py` → `planning_audit_logger_agent` |
 | `supplier_signal_agent` (**Sable**) | Supplier-Risk Analyst | Ingests supplier signals, proposes alternates; `@chain` floor forces a human on a slip it can't safely absorb (force-majeure / severity / single-source). | llm (gpt-4o-mini), `agency/supplier_signal_agent.py`, playbook `supplier_triage` → `planner_human` (severe) \| `scheduler` (re-plan) |
-| `planner_human` | Production planner | Decides flagged schedules + supplier reviews; approves release. Answers within 2h (same shift). | human, Studio Inbox, dual → `scheduler` (supplier approved) \| `release_agent` (schedule approved) \| audit (rejected / held_for_review) |
-| `plant_manager_human` | Plant manager | The safety/quality call on a safety-stock breach. Answers within 4h. | human, Studio Inbox, dual → `release_agent` (approved) \| audit (rejected / held_for_review) |
-| `ops_director_human` | Operations director | Accountable owner; reviews exceptions (unclear demand picture, exhausted re-sense) + the Manager's escalations. Answers within 8h (a business day). | human, Studio Inbox, dual → `release_agent` (approved) \| audit (rejected / held_for_review) |
+| `planner_human` | Production planner | Decides flagged schedules + supplier reviews; approves release. Answers within 2h (same shift). | human, Studio Inbox, chain + reply reader → `scheduler` (`approve` on a supplier review) \| `release_agent` (`approve` on a schedule) \| audit (`reject` / `hold`) |
+| `plant_manager_human` | Plant manager | The safety/quality call on a safety-stock breach. Answers within 4h. | human, Studio Inbox, chain + reply reader → `release_agent` (`approve`) \| audit (`reject` / `hold`) \| `answer` → the agent that asked |
+| `ops_director_human` | Operations director | Accountable owner; reviews exceptions (unclear demand picture, exhausted re-sense) + the Manager's escalations. Answers within 8h (a business day). | human, Studio Inbox, chain + reply reader → `release_agent` (`approve`) \| audit (`reject` / `hold`) \| `answer` → the agent that asked |
 | `planning_audit_logger_agent` | Compliance recorder | Hash-chained WORM audit of every release, approval, hold, intervention. Terminus. | external (`framework: custom`), `agency/_shared/audit_logger.py`, terminal |
 
 The **Manager** (`gpt-4o-mini`, static routing) is the supervisor, not a
@@ -142,12 +142,18 @@ router in the middle of the team. It escalates to the Ops Director
 bad config), when 5 different agents fail in one case, or when restarts run
 out. A malformed hand-off only raises an alert.
 
+**How a person replies.** The Inbox has no buttons. The person types a
+reply, and a small reply reader (`gpt-4o-mini`) turns it into a verdict from
+the table above. Anything that is not a clear yes or no — not now, wait —
+reads as `hold`. On the plant manager and ops director seats, a reply that
+answers an agent's question reads as `answer` and goes back to only the agent
+that asked.
+
 **If nobody answers.** Each human request waits for the time in the table
-above. If nobody answers within it, the request waits no longer: its Inbox
-card closes and the ticket records that no reply came. Nothing is released
-on silence, and nobody is chased automatically. (Each seat's
-`fallback_response` — `held_for_review` → audit — states the intended
-default-deny; leafmesh 2.4.486 does not route it for these seats yet.)
+above. If nobody answers within it, the seat's default reply
+(`fallback_response`: `verdict: hold`, `held_for_review`) goes through its
+routes like any reply and is recorded in the audit log. Nothing is released
+on silence, and nobody is chased automatically.
 
 ## 5. Trust mechanisms
 
@@ -163,9 +169,9 @@ default-deny; leafmesh 2.4.486 does not route it for these seats yet.)
 - **Supplier review floor** — Sable's `@chain` forces a human on
   force-majeure, severity floors, or a single-source vendor.
 - **Nothing released on silence** — planner (2h), plant manager (4h), ops
-  director (8h). An unanswered request closes its Inbox card and the ticket
-  records that no reply came; every answer (approved / rejected /
-  held_for_review) has a route.
+  director (8h). An unanswered request's default `hold` goes to the audit
+  log; every verdict (approve / reject / hold, and answer where the seat
+  has it) has a route.
 - **WORM audit** — hash-chained, append-only; insertion/deletion detectable.
 - **Stub announces itself** — every dev-store read returns `available:
   false` when it has no real source, never a confident empty result.
@@ -173,7 +179,7 @@ default-deny; leafmesh 2.4.486 does not route it for these seats yet.)
 ## Quick start
 
 ```bash
-# First, in .env (create-leafmesh wrote it): set LEAFMESH_LICENSE_KEY (+ OPENAI/ANTHROPIC keys).
+# First, in .env (create-leafmesh wrote it): set the OPENAI/ANTHROPIC keys; the first start asks for the licence key (never saved).
 
 # With Docker — starts Redis, loads the team into it once, starts the agency:
 create-leafmesh --start .

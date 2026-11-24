@@ -89,12 +89,13 @@ hash-chained audit entry. Maya's day shrinks to the exceptions that matter.
 - **Supplier review floor** — Sable's `@chain` re-derives
   `requires_planner_review` (force-majeure / severity / single-source).
 - **Nothing released on silence** — planner (2h), plant manager (4h), ops
-  director (8h). An unanswered request closes its Inbox card and the ticket
-  records that no reply came; nobody is chased automatically. Each seat's
-  `fallback_response` (`held_for_review` → the WORM sink) is the declared
-  intent; leafmesh 2.4.486 does not route it for dual seats yet. Every answer
-  value (approved / rejected / held_for_review) has a route. No human→human
-  wires (avoids the dual→dual footgun).
+  director (8h). Each seat is `chain` with a `reply_reader` (`gpt-4o-mini`)
+  that turns the typed reply into a `verdict`. When nobody answers, the
+  seat's `fallback_response` (`verdict: hold`, `held_for_review`) goes
+  through its routes like any reply and lands in the WORM sink; nobody is
+  chased automatically. Every verdict (approve / reject / hold, and answer
+  back to only the asking agent where the seat has it) has a route. No
+  human→human wires; escalation goes through the coordinator or the Manager.
 - **Hash-chained WORM** — `planning_audit_logger_agent` on every outcome.
 
 ## 6. Where data lives

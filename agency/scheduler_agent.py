@@ -13,7 +13,7 @@ this CODE fails closed and bounds the retry.
      the Ops Director instead of looping forever (Rule 3).
   c) PRE-GATE STASH — when conflicts route the chain through a human, the
      SDK resumes with only human meta fields; the full schedule is stashed
-     per session so the finisher can recover it after the gate. A clean
+     per session so the finisher can recover it after the decision. A clean
      schedule also renders a draft to ./out for the planner to look at.
 """
 from __future__ import annotations

@@ -42,9 +42,9 @@ tools and the finisher check the vault records themselves. Until
 dev outbox job that announces itself (`released: false`, `status:
 recorded_dev`) — it never fakes a real MES ack.
 
-## Human gates
+## Human steps
 
-Scenarios 03 (and any flagged re-opt) route to a human gate. The request lands
+Scenarios 03 (and any flagged re-opt) route to a human step. The request lands
 in **Studio → Inbox** — answer it there (approved / rejected /
 held_for_review). Unanswered, it waits until `human_timeout_seconds`; then its
 card closes and the ticket records that no reply came. Nothing is released
